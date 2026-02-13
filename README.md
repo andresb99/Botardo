@@ -63,6 +63,7 @@ npm test
 - `!play <url or search>`: Add a song, playlist, or stream URL to queue.
 - `!stream <url>`: Alias of `!play` (useful for stream links).
 - `!skip`: Skip current track.
+- `!timeskip <seconds>` (`!seek` / `!ts`): Jump forward inside current song. If it exceeds song duration, it skips to next track.
 - `!prev`: Play the previously played track.
 - `!stop`: Stop playback, clear queue, disconnect bot.
 - `!clear`: Clear queue only (keep current track playing).
@@ -84,6 +85,7 @@ npm test
 !play https://www.youtube.com/watch?v=tmYIY3m7X2U
 !stream https://www.twitch.tv/elxokas
 !play https://open.spotify.com/playlist/37i9dQZF1DX2apWzyECwyZ
+!timeskip 45
 !queue
 !ask explain closures in JavaScript with examples
 ```

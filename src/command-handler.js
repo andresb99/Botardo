@@ -47,6 +47,18 @@ function buildAllQueueReport(queue) {
   return lines.join('\n');
 }
 
+function formatSeconds(value) {
+  const seconds = Math.max(0, Math.floor(Number(value) || 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+  return `${minutes}:${String(secs).padStart(2, '0')}`;
+}
+
 async function handleCommand({ command, args, message, queue, deps }) {
   const {
     connectToVoice,
@@ -57,6 +69,9 @@ async function handleCommand({ command, args, message, queue, deps }) {
     splitForDiscord,
     stopTranscoder,
     cloneTrack,
+    getPlaybackPositionSeconds = () => 0,
+    markPlaybackPaused = () => {},
+    markPlaybackResumed = () => {},
     maxAskChunks = 4,
   } = deps;
 
@@ -140,6 +155,61 @@ async function handleCommand({ command, args, message, queue, deps }) {
     return true;
   }
 
+  if (command === 'timeskip' || command === 'seek' || command === 'ts') {
+    if (!args) {
+      await message.reply('Uso: `!timeskip <segundos>`');
+      return true;
+    }
+
+    if (!queue.nowPlaying) {
+      await message.reply('No hay ninguna pista sonando.');
+      return true;
+    }
+
+    if (queue.nowPlaying.isLive) {
+      await message.reply('No se puede adelantar una transmision en vivo.');
+      return true;
+    }
+
+    const jumpSeconds = Number(args);
+    if (!Number.isFinite(jumpSeconds) || jumpSeconds <= 0) {
+      await message.reply('Ingresa una cantidad de segundos valida (mayor a 0).');
+      return true;
+    }
+
+    const currentPosition = Math.max(0, Number(getPlaybackPositionSeconds(queue)) || 0);
+    const targetPosition = currentPosition + jumpSeconds;
+    const durationSec = Number(queue.nowPlaying.durationSec);
+    const hasDuration = Number.isFinite(durationSec) && durationSec > 0;
+
+    if (hasDuration && targetPosition >= durationSec) {
+      queue.preserveConnectionOnEmpty = true;
+      queue.ignoreAbortErrors = true;
+      stopTranscoder(queue);
+      queue.player.stop(true);
+      await message.reply('El salto supera la duracion de la pista. Saltando cancion...');
+      return true;
+    }
+
+    const resumedTrack = cloneTrack(queue.nowPlaying);
+    resumedTrack.startOffsetSec = targetPosition;
+    resumedTrack.prefetchedUrl = null;
+    queue.tracks.unshift(resumedTrack);
+    queue.suppressHistoryOnce = true;
+    queue.preserveConnectionOnEmpty = true;
+    queue.ignoreAbortErrors = true;
+    stopTranscoder(queue);
+    queue.player.stop(true);
+
+    const durationNote = hasDuration
+      ? ` de ${formatSeconds(durationSec)}`
+      : '';
+    await message.reply(
+      `Adelantando a ${formatSeconds(targetPosition)}${durationNote}.`
+    );
+    return true;
+  }
+
   if (command === 'prev') {
     if (!queue.history.length) {
       await message.reply('No hay una pista anterior en el historial.');
@@ -204,12 +274,14 @@ async function handleCommand({ command, args, message, queue, deps }) {
   }
 
   if (command === 'pause') {
+    markPlaybackPaused(queue);
     queue.player.pause();
     await message.reply('Pausa.');
     return true;
   }
 
   if (command === 'resume') {
+    markPlaybackResumed(queue);
     queue.player.unpause();
     await message.reply('Reanudado.');
     return true;

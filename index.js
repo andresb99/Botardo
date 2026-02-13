@@ -127,6 +127,28 @@ function sourceLabel(source) {
   return 'Link';
 }
 
+function parseDurationSeconds(value) {
+  if (value == null) return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric;
+  }
+
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (!trimmed.includes(':')) return null;
+
+  const parts = trimmed.split(':').map((part) => Number(part));
+  if (parts.some((part) => !Number.isFinite(part) || part < 0)) return null;
+
+  let seconds = 0;
+  for (const part of parts) {
+    seconds = seconds * 60 + part;
+  }
+  return seconds > 0 ? seconds : null;
+}
+
 function cloneTrack(track) {
   if (!track) return null;
   return {
@@ -136,6 +158,36 @@ function cloneTrack(track) {
     attempts: 0,
     playbackRetries: 0,
   };
+}
+
+function resetPlaybackTiming(queue) {
+  queue.currentTrackStartedAt = 0;
+  queue.currentTrackPausedAt = 0;
+  queue.currentTrackPausedMs = 0;
+}
+
+function getPlaybackPositionSeconds(queue) {
+  if (!queue?.nowPlaying) return 0;
+
+  const baseOffset = Math.max(0, Number(queue.nowPlaying.startOffsetSec) || 0);
+  if (!queue.currentTrackStartedAt) return baseOffset;
+
+  const pausedAt = queue.currentTrackPausedAt || Date.now();
+  const elapsedMs = pausedAt - queue.currentTrackStartedAt - (queue.currentTrackPausedMs || 0);
+  return baseOffset + Math.max(0, elapsedMs) / 1000;
+}
+
+function markPlaybackPaused(queue) {
+  if (!queue?.nowPlaying) return;
+  if (queue.currentTrackPausedAt) return;
+  queue.currentTrackPausedAt = Date.now();
+}
+
+function markPlaybackResumed(queue) {
+  if (!queue?.nowPlaying) return;
+  if (!queue.currentTrackPausedAt) return;
+  queue.currentTrackPausedMs += Date.now() - queue.currentTrackPausedAt;
+  queue.currentTrackPausedAt = 0;
 }
 
 function buildNowPlayingPayload(track, pendingCount) {
@@ -176,25 +228,35 @@ function stopTranscoder(queue) {
   queue.transcoder = null;
 }
 
-function createTranscoder(inputUrl) {
+function createTranscoder(inputUrl, startOffsetSec = 0) {
   if (!ffmpegPath) {
     throw new Error('No se encontro ffmpeg. Verifica ffmpeg-static.');
   }
 
+  const offset = Number(startOffsetSec);
+  const args = [
+    '-nostdin',
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
+  ];
+
+  if (Number.isFinite(offset) && offset > 0) {
+    args.push('-ss', offset.toFixed(3));
+  }
+
+  args.push(
+    '-i', inputUrl,
+    '-vn',
+    '-ac', '2',
+    '-ar', '48000',
+    '-f', 's16le',
+    'pipe:1'
+  );
+
   return spawn(
     ffmpegPath,
-    [
-      '-nostdin',
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5',
-      '-i', inputUrl,
-      '-vn',
-      '-ac', '2',
-      '-ar', '48000',
-      '-f', 's16le',
-      'pipe:1',
-    ],
+    args,
     {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -528,17 +590,22 @@ function getQueue(guildId) {
       ignoreAbortErrors: false,
       suppressHistoryOnce: false,
       transitionInProgress: false,
+      currentTrackStartedAt: 0,
+      currentTrackPausedAt: 0,
+      currentTrackPausedMs: 0,
     };
 
     player.on(AudioPlayerStatus.Idle, () => {
       state.playing = false;
       stopTranscoder(state);
+      resetPlaybackTiming(state);
       void playNext(guildId);
     });
 
     player.on('error', (err) => {
       state.playing = false;
       stopTranscoder(state);
+      resetPlaybackTiming(state);
       const isAbortLike = /aborted|premature close|ECONNRESET|socket hang up|EPIPE/i.test(err?.message || '');
       if (state.nowPlaying && isAbortLike && !state.ignoreAbortErrors) {
         state.nowPlaying.playbackRetries = (state.nowPlaying.playbackRetries || 0) + 1;
@@ -574,6 +641,7 @@ async function resolveYoutubeTrack(query, requestedBy) {
     requestedBy,
     source: 'youtube',
     isLive: Boolean(video.live),
+    durationSec: parseDurationSeconds(video.durationInSec || video.durationRaw || video.duration_raw),
   };
 }
 
@@ -628,6 +696,12 @@ async function resolveYouTubeTracks(url, requestedBy) {
         requestedBy,
         source: 'youtube',
         isLive: Boolean(info.video_details.live),
+        durationSec: parseDurationSeconds(
+          info.video_details.durationInSec
+            || info.video_details.durationRaw
+            || info.video_details.duration_raw
+            || info.video_details.duration
+        ),
       },
     ];
   }
@@ -641,6 +715,7 @@ async function resolveYouTubeTracks(url, requestedBy) {
       requestedBy,
       source: 'youtube',
       isLive: Boolean(video.live),
+      durationSec: parseDurationSeconds(video.durationInSec || video.durationRaw || video.duration_raw),
     })).filter((t) => isValidUrl(t.url));
   }
 
@@ -672,6 +747,7 @@ async function resolveDirectMediaTrack(url, requestedBy) {
         requestedBy,
         source,
         isLive: Boolean(info?.is_live),
+        durationSec: parseDurationSeconds(info?.duration),
       },
     ];
   } catch {
@@ -682,6 +758,7 @@ async function resolveDirectMediaTrack(url, requestedBy) {
         requestedBy,
         source: 'url',
         isLive: false,
+        durationSec: null,
       },
     ];
   }
@@ -742,6 +819,7 @@ async function connectToVoice(queue, voiceChannel) {
     queue.playing = false;
     queue.transitionInProgress = false;
     queue.suppressHistoryOnce = false;
+    resetPlaybackTiming(queue);
     stopTranscoder(queue);
     queue.connection?.destroy();
     queue.connection = null;
@@ -774,6 +852,7 @@ async function playNext(guildId) {
     const preserveConnection = queue.preserveConnectionOnEmpty;
     queue.preserveConnectionOnEmpty = false;
     stopTranscoder(queue);
+    resetPlaybackTiming(queue);
     queue.nowPlaying = null;
     queue.playing = false;
     queue.transitionInProgress = false;
@@ -796,11 +875,12 @@ async function playNext(guildId) {
       return;
     }
     next.attempts = (next.attempts || 0) + 1;
+    const startOffsetSec = Math.max(0, Number(next.startOffsetSec) || 0);
     const directUrl = (!next.isLive && next.prefetchedUrl)
       ? next.prefetchedUrl
       : await getDirectAudioUrl(next.url);
     stopTranscoder(queue);
-    const transcoder = createTranscoder(directUrl);
+    const transcoder = createTranscoder(directUrl, startOffsetSec);
     queue.transcoder = transcoder;
 
     transcoder.on('error', (err) => {
@@ -827,6 +907,10 @@ async function playNext(guildId) {
     queue.player.play(resource);
     queue.playing = true;
     queue.transitionInProgress = false;
+    queue.currentTrackStartedAt = Date.now();
+    queue.currentTrackPausedAt = 0;
+    queue.currentTrackPausedMs = 0;
+    next.startOffsetSec = startOffsetSec;
     next.playbackRetries = 0;
     queue.nowPlaying = next;
 
@@ -840,6 +924,7 @@ async function playNext(guildId) {
   } catch (err) {
     console.error('Error reproduciendo:', err);
     queue.playing = false;
+    resetPlaybackTiming(queue);
     queue.nowPlaying = null;
     queue.transitionInProgress = false;
     if ((next.attempts || 0) < 2) {
@@ -878,6 +963,9 @@ client.on('messageCreate', async (message) => {
       splitForDiscord,
       stopTranscoder,
       cloneTrack,
+      getPlaybackPositionSeconds,
+      markPlaybackPaused,
+      markPlaybackResumed,
       maxAskChunks: 4,
     },
   });
@@ -898,6 +986,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     queue.playing = false;
     queue.transitionInProgress = false;
     queue.suppressHistoryOnce = false;
+    resetPlaybackTiming(queue);
     stopTranscoder(queue);
     queue.connection?.destroy();
     queue.connection = null;

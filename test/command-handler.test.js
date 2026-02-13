@@ -90,6 +90,9 @@ function createDeps(overrides = {}) {
     askGemini: 0,
     splitForDiscord: 0,
     stopTranscoder: 0,
+    getPlaybackPositionSeconds: 0,
+    markPlaybackPaused: 0,
+    markPlaybackResumed: 0,
   };
 
   const deps = {
@@ -116,6 +119,16 @@ function createDeps(overrides = {}) {
     },
     stopTranscoder() {
       calls.stopTranscoder += 1;
+    },
+    getPlaybackPositionSeconds() {
+      calls.getPlaybackPositionSeconds += 1;
+      return 0;
+    },
+    markPlaybackPaused() {
+      calls.markPlaybackPaused += 1;
+    },
+    markPlaybackResumed() {
+      calls.markPlaybackResumed += 1;
     },
     cloneTrack(track) {
       return { ...track };
@@ -224,6 +237,67 @@ test('skip command: keeps connection and stops current track', async () => {
   assert.equal(replies[0], 'Saltando pista...');
 });
 
+test('timeskip command: seeks inside current track when target is within duration', async () => {
+  const { message, replies } = createMessage();
+  const { queue, counters } = createQueue({
+    nowPlaying: { title: 'Song A', durationSec: 220 },
+    tracks: [{ title: 'Next Song' }],
+  });
+  const { deps, calls } = createDeps({
+    getPlaybackPositionSeconds() {
+      calls.getPlaybackPositionSeconds += 1;
+      return 40;
+    },
+  });
+
+  const handled = await handleCommand({
+    command: 'timeskip',
+    args: '30',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.equal(calls.getPlaybackPositionSeconds, 1);
+  assert.equal(calls.stopTranscoder, 1);
+  assert.equal(counters.stopCalls, 1);
+  assert.equal(queue.suppressHistoryOnce, true);
+  assert.equal(queue.preserveConnectionOnEmpty, true);
+  assert.equal(queue.ignoreAbortErrors, true);
+  assert.equal(queue.tracks[0].title, 'Song A');
+  assert.equal(queue.tracks[0].startOffsetSec, 70);
+  assert.equal(replies[0], 'Adelantando a 1:10 de 3:40.');
+});
+
+test('timeskip command: skips track if jump exceeds duration', async () => {
+  const { message, replies } = createMessage();
+  const { queue, counters } = createQueue({
+    nowPlaying: { title: 'Song A', durationSec: 100 },
+  });
+  const { deps, calls } = createDeps({
+    getPlaybackPositionSeconds() {
+      calls.getPlaybackPositionSeconds += 1;
+      return 90;
+    },
+  });
+
+  const handled = await handleCommand({
+    command: 'timeskip',
+    args: '15',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.equal(calls.getPlaybackPositionSeconds, 1);
+  assert.equal(calls.stopTranscoder, 1);
+  assert.equal(counters.stopCalls, 1);
+  assert.equal(queue.tracks.length, 0);
+  assert.equal(replies[0], 'El salto supera la duracion de la pista. Saltando cancion...');
+});
+
 test('prev command: loads previous track before current and triggers player stop', async () => {
   const { message, replies } = createMessage();
   const { queue, counters } = createQueue({
@@ -303,7 +377,7 @@ test('clear command: removes pending queue only', async () => {
 test('pause command: pauses player', async () => {
   const { message, replies } = createMessage();
   const { queue, counters } = createQueue();
-  const { deps } = createDeps();
+  const { deps, calls } = createDeps();
 
   const handled = await handleCommand({
     command: 'pause',
@@ -315,13 +389,14 @@ test('pause command: pauses player', async () => {
 
   assert.equal(handled, true);
   assert.equal(counters.pauseCalls, 1);
+  assert.equal(calls.markPlaybackPaused, 1);
   assert.equal(replies[0], 'Pausa.');
 });
 
 test('resume command: unpauses player', async () => {
   const { message, replies } = createMessage();
   const { queue, counters } = createQueue();
-  const { deps } = createDeps();
+  const { deps, calls } = createDeps();
 
   const handled = await handleCommand({
     command: 'resume',
@@ -333,6 +408,7 @@ test('resume command: unpauses player', async () => {
 
   assert.equal(handled, true);
   assert.equal(counters.unpauseCalls, 1);
+  assert.equal(calls.markPlaybackResumed, 1);
   assert.equal(replies[0], 'Reanudado.');
 });
 
