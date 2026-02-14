@@ -21,15 +21,7 @@ const {
 } = require('@discordjs/voice');
 const playdl = require('play-dl');
 const ytDlp = require('yt-dlp-exec');
-const fs = require('node:fs');
-let ytdlCore = null;
-try {
-  ytdlCore = require('@distube/ytdl-core');
-} catch {
-  ytdlCore = null;
-}
-const { spawn, execFile } = require('child_process');
-const { promisify } = require('util');
+const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 const { handleCommand } = require('./src/command-handler');
 const { PokemonMiniGame } = require('./src/pokemon-game');
@@ -44,15 +36,6 @@ const SPOTIFY_MAX_TRACKS = Math.max(1, Math.min(1000, Number(process.env.SPOTIFY
 const HISTORY_LIMIT = 50;
 const QUEUE_IDLE_DISCONNECT_MS = Math.max(0, Number(process.env.QUEUE_IDLE_DISCONNECT_SECONDS || 180)) * 1000;
 const SYSTEM_FFMPEG_PATH = process.env.FFMPEG_PATH || ffmpegPath || 'ffmpeg';
-const SYSTEM_YTDLP_PATH = process.env.YTDLP_PATH || process.env.YOUTUBE_DL_FILENAME || 'yt-dlp';
-const YTDLP_EXTRACTOR_ARGS = String(process.env.YTDLP_EXTRACTOR_ARGS || 'youtube:player_client=android').trim();
-const YTDLP_COOKIES_PATH = String(process.env.YTDLP_COOKIES_PATH || '/tmp/youtube-cookies.txt').trim();
-const YTDLP_COOKIES_BASE64 = String(process.env.YTDLP_COOKIES_BASE64 || '').trim();
-const YTDLP_COOKIES = String(process.env.YTDLP_COOKIES || '').trim();
-const YOUTUBE_COOKIE_HEADER = String(process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIE_HEADER || '').trim();
-const execFileAsync = promisify(execFile);
-let ytDlpCookieFilePath = '';
-let ytCookieHeaderFromFile = '';
 
 if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
@@ -406,172 +389,16 @@ function createTranscoder(inputUrl, startOffsetSec = 0) {
   );
 }
 
-function parseNetscapeCookiesToHeader(rawText) {
-  const lines = String(rawText || '').split(/\r?\n/);
-  const pairs = new Map();
-
-  for (const line of lines) {
-    const row = String(line || '').trim();
-    if (!row || row.startsWith('#')) continue;
-    const parts = row.split('\t');
-    if (parts.length < 7) continue;
-    const domain = String(parts[0] || '').toLowerCase();
-    const name = String(parts[5] || '').trim();
-    const value = String(parts[6] || '').trim();
-    if (!name || !value) continue;
-    if (!domain.includes('youtube.com') && !domain.includes('google.com')) continue;
-    pairs.set(name, value);
-  }
-
-  if (!pairs.size) return '';
-  return Array.from(pairs.entries()).map(([name, value]) => `${name}=${value}`).join('; ');
-}
-
-function getYouTubeCookieHeader() {
-  return YOUTUBE_COOKIE_HEADER || ytCookieHeaderFromFile || '';
-}
-
-function ensureYtDlpCookiesFile() {
-  if (ytDlpCookieFilePath) return ytDlpCookieFilePath;
-
-  if (YTDLP_COOKIES_BASE64) {
-    try {
-      const decoded = Buffer.from(YTDLP_COOKIES_BASE64, 'base64').toString('utf8').trim();
-      if (decoded) {
-        ytCookieHeaderFromFile = parseNetscapeCookiesToHeader(decoded);
-        fs.writeFileSync(YTDLP_COOKIES_PATH, decoded, { encoding: 'utf8', mode: 0o600 });
-        ytDlpCookieFilePath = YTDLP_COOKIES_PATH;
-        return ytDlpCookieFilePath;
-      }
-    } catch (error) {
-      console.warn('[YouTube] No pude decodificar YTDLP_COOKIES_BASE64:', error?.message || error);
-    }
-  }
-
-  if (YTDLP_COOKIES) {
-    try {
-      ytCookieHeaderFromFile = parseNetscapeCookiesToHeader(YTDLP_COOKIES);
-      fs.writeFileSync(YTDLP_COOKIES_PATH, YTDLP_COOKIES, { encoding: 'utf8', mode: 0o600 });
-      ytDlpCookieFilePath = YTDLP_COOKIES_PATH;
-      return ytDlpCookieFilePath;
-    } catch (error) {
-      console.warn('[YouTube] No pude escribir YTDLP_COOKIES:', error?.message || error);
-    }
-  }
-
-  try {
-    if (YTDLP_COOKIES_PATH && fs.existsSync(YTDLP_COOKIES_PATH)) {
-      try {
-        const raw = fs.readFileSync(YTDLP_COOKIES_PATH, 'utf8');
-        ytCookieHeaderFromFile = parseNetscapeCookiesToHeader(raw);
-      } catch {
-        // ignore local read issues
-      }
-      ytDlpCookieFilePath = YTDLP_COOKIES_PATH;
-      return ytDlpCookieFilePath;
-    }
-  } catch {
-    // ignore fs checks
-  }
-
-  return '';
-}
-
-async function runYtDlpWithFallback(target, options) {
-  const cookiesPath = ensureYtDlpCookiesFile();
-  const cookieHeader = getYouTubeCookieHeader();
-  const mergedOptions = { ...(options || {}) };
-  if (YTDLP_EXTRACTOR_ARGS && !mergedOptions.extractorArgs) {
-    mergedOptions.extractorArgs = YTDLP_EXTRACTOR_ARGS;
-  }
-  if (cookiesPath && !mergedOptions.cookies) {
-    mergedOptions.cookies = cookiesPath;
-  }
-  if (!cookiesPath && cookieHeader && !mergedOptions.addHeader) {
-    mergedOptions.addHeader = [`Cookie: ${cookieHeader}`];
-  }
-
-  try {
-    return await ytDlp(target, mergedOptions);
-  } catch (primaryError) {
-    const args = [];
-    if (mergedOptions?.g) args.push('-g');
-    if (mergedOptions?.f) args.push('-f', String(mergedOptions.f));
-    if (mergedOptions?.dumpSingleJson) args.push('--dump-single-json');
-    if (mergedOptions?.flatPlaylist) args.push('--flat-playlist');
-    if (mergedOptions?.skipDownload) args.push('--skip-download');
-    if (mergedOptions?.noWarnings) args.push('--no-warnings');
-    if (mergedOptions?.noPlaylist) args.push('--no-playlist');
-    if (YTDLP_EXTRACTOR_ARGS) args.push('--extractor-args', YTDLP_EXTRACTOR_ARGS);
-    if (cookiesPath) args.push('--cookies', cookiesPath);
-    if (!cookiesPath && cookieHeader) args.push('--add-header', `Cookie: ${cookieHeader}`);
-    args.push(String(target));
-
-    const { stdout } = await execFileAsync(SYSTEM_YTDLP_PATH, args, {
-      maxBuffer: 64 * 1024 * 1024,
-      windowsHide: true,
-    });
-    if (!String(stdout || '').trim()) {
-      throw primaryError;
-    }
-    return stdout;
-  }
-}
-
-async function getDirectAudioUrlFromYouTubeCore(videoUrl) {
-  if (!ytdlCore || typeof ytdlCore.getInfo !== 'function') {
-    throw new Error('ytdl-core no disponible');
-  }
-  const cookieHeader = getYouTubeCookieHeader();
-
-  const info = await ytdlCore.getInfo(
-    videoUrl,
-    cookieHeader
-      ? {
-        requestOptions: {
-          headers: {
-            cookie: cookieHeader,
-          },
-        },
-      }
-      : undefined
-  );
-  const formats = Array.isArray(info?.formats) ? info.formats : [];
-  const candidates = formats
-    .filter((format) => format?.hasAudio && isValidUrl(format?.url))
-    .sort((left, right) => {
-      const leftScore = Number(left?.audioBitrate || 0) + (left?.hasVideo ? 0 : 1000);
-      const rightScore = Number(right?.audioBitrate || 0) + (right?.hasVideo ? 0 : 1000);
-      return rightScore - leftScore;
-    });
-
-  const best = candidates[0];
-  if (!isValidUrl(best?.url)) {
-    throw new Error('No se encontro un formato de audio valido en ytdl-core');
-  }
-  return String(best.url).trim();
-}
-
 async function getDirectAudioUrl(videoUrl) {
-  try {
-    const output = await runYtDlpWithFallback(videoUrl, {
-      g: true,
-      f: 'bestaudio/best',
-      noPlaylist: true,
-      noWarnings: true,
-    });
-    const directUrl = String(output).split(/\r?\n/).find((line) => line.trim());
-    if (isValidUrl(directUrl)) {
-      return directUrl.trim();
-    }
-  } catch (error) {
-    if (!isYouTubeUrl(videoUrl)) {
-      throw error;
-    }
-  }
-
-  if (isYouTubeUrl(videoUrl)) {
-    return await getDirectAudioUrlFromYouTubeCore(videoUrl);
+  const output = await ytDlp(videoUrl, {
+    g: true,
+    f: 'bestaudio/best',
+    noPlaylist: true,
+    noWarnings: true,
+  });
+  const directUrl = String(output).split(/\r?\n/).find((line) => line.trim());
+  if (isValidUrl(directUrl)) {
+    return directUrl.trim();
   }
 
   throw new Error('No se pudo obtener una URL directa valida.');
@@ -588,45 +415,12 @@ function buildPlaybackErrorHint(error) {
     return 'Parece que falta `yt-dlp` en el host o no esta en PATH.';
   }
   if (raw.includes('ffmpeg') || raw.includes('invalid data found') || raw.includes('error while decoding')) {
-    return 'Parece que `ffmpeg` no esta disponible correctamente en el host.';
+    return 'Parece que `ffmpeg` no esta disponible correctamente.';
   }
   if (raw.includes('403') || raw.includes('429')) {
     return 'La fuente rechazo temporalmente la reproduccion (rate limit o bloqueo).';
   }
-  if (raw.includes("sign in to confirm you're not a bot") || raw.includes('confirm you’re not a bot')) {
-    return 'YouTube esta bloqueando la IP del servidor. Configura cookies de YouTube (YTDLP_COOKIES_BASE64 o YOUTUBE_COOKIE).';
-  }
-  return 'Revisa logs del deploy para el detalle tecnico.';
-}
-
-function shortErrorMessage(error, max = 180) {
-  const text = String(error?.message || error || '').replace(/\s+/g, ' ').trim();
-  if (!text) return 'sin detalle';
-  if (text.length <= max) return text;
-  return `${text.slice(0, Math.max(1, max - 3))}...`;
-}
-
-async function createYouTubePlayDlResource(videoUrl, startOffsetSec = 0) {
-  const seek = Math.max(0, Number(startOffsetSec) || 0);
-  const cookieHeader = getYouTubeCookieHeader();
-  const streamData = await playdl.stream(videoUrl, {
-    discordPlayerCompatibility: true,
-    quality: 2,
-    seek,
-    requestOptions: cookieHeader
-      ? {
-        headers: {
-          cookie: cookieHeader,
-        },
-      }
-      : undefined,
-  });
-  if (!streamData?.stream) {
-    throw new Error('play-dl no devolvio un stream valido.');
-  }
-  return createAudioResource(streamData.stream, {
-    inputType: streamData.type ?? StreamType.Arbitrary,
-  });
+  return 'Revisa logs para el detalle tecnico.';
 }
 
 function splitForDiscord(text, maxLength = 1900) {
@@ -1178,7 +972,7 @@ async function resolveYouTubePlaylistTracksViaYtDlp(url, requestedBy) {
   if (!isYouTubePlaylistLikeUrl(url)) return [];
 
   try {
-    const output = await runYtDlpWithFallback(url, {
+    const output = await ytDlp(url, {
       dumpSingleJson: true,
       flatPlaylist: true,
       skipDownload: true,
@@ -1220,7 +1014,7 @@ async function resolveDirectMediaTrack(url, requestedBy) {
   if (!isValidUrl(url) || isSpotifyUrl(url)) return [];
 
   try {
-    const output = await runYtDlpWithFallback(url, {
+    const output = await ytDlp(url, {
       dumpSingleJson: true,
       skipDownload: true,
       noWarnings: true,
@@ -1381,71 +1175,49 @@ async function playNext(guildId) {
     }
     next.attempts = (next.attempts || 0) + 1;
     const startOffsetSec = Math.max(0, Number(next.startOffsetSec) || 0);
-    let resource;
-    try {
-      const directUrl = (!next.isLive && next.prefetchedUrl)
-        ? next.prefetchedUrl
-        : await getDirectAudioUrl(next.url);
-      stopTranscoder(queue);
-      const transcoder = createTranscoder(directUrl, startOffsetSec);
-      queue.transcoder = transcoder;
+    const directUrl = (!next.isLive && next.prefetchedUrl)
+      ? next.prefetchedUrl
+      : await getDirectAudioUrl(next.url);
+    stopTranscoder(queue);
+    const transcoder = createTranscoder(directUrl, startOffsetSec);
+    queue.transcoder = transcoder;
 
-      transcoder.on('error', (err) => {
-        if (queue.transcoder !== transcoder) return;
-        console.error('Transcoder error:', err.message);
-        queue.player.stop();
-      });
+    transcoder.on('error', (err) => {
+      if (queue.transcoder !== transcoder) return;
+      console.error('Transcoder error:', err.message);
+      queue.player.stop();
+    });
 
-      transcoder.stderr.on('data', () => {
-        // stderr is noisy in ffmpeg; keep process alive and rely on close/error events.
-      });
+    transcoder.stderr.on('data', () => {
+      // stderr is noisy in ffmpeg; keep process alive and rely on close/error events.
+    });
 
-      transcoder.on('close', (code) => {
-        if (queue.transcoder !== transcoder) return;
-        if (queue.playing && code !== 0) {
-          if (!queue.ignoreAbortErrors) {
-            const snapshot = queue.nowPlaying ? cloneTrack(queue.nowPlaying) : cloneTrack(next);
-            const attempts = Number(snapshot?.attempts || next?.attempts || 1);
-            if (snapshot && attempts < 2) {
-              snapshot.prefetchedUrl = null;
-              queue.tracks.unshift(snapshot);
-              queue.suppressHistoryOnce = true;
-              queue.textChannel?.send(
-                `ffmpeg corto la reproduccion, reintentando: **${snapshot.title}** (${attempts}/2)`
-              ).catch(() => {});
-            } else {
-              queue.textChannel?.send(
-                `No pude decodificar el audio (${code}).`
-              ).catch(() => {});
-            }
+    transcoder.on('close', (code) => {
+      if (queue.transcoder !== transcoder) return;
+      if (queue.playing && code !== 0) {
+        if (!queue.ignoreAbortErrors) {
+          const snapshot = queue.nowPlaying ? cloneTrack(queue.nowPlaying) : cloneTrack(next);
+          const attempts = Number(snapshot?.attempts || next?.attempts || 1);
+          if (snapshot && attempts < 2) {
+            snapshot.prefetchedUrl = null;
+            queue.tracks.unshift(snapshot);
+            queue.suppressHistoryOnce = true;
+            queue.textChannel?.send(
+              `ffmpeg corto la reproduccion, reintentando: **${snapshot.title}** (${attempts}/2)`
+            ).catch(() => {});
+          } else {
+            queue.textChannel?.send(
+              `No pude decodificar el audio (${code}).`
+            ).catch(() => {});
           }
-          queue.player.stop();
         }
-      });
-
-      resource = createAudioResource(transcoder.stdout, {
-        inputType: StreamType.Raw,
-      });
-    } catch (primaryPlaybackError) {
-      stopTranscoder(queue);
-      queue.transcoder = null;
-
-      if (!isYouTubeUrl(next.url)) {
-        throw primaryPlaybackError;
+        queue.player.stop();
       }
+    });
 
-      try {
-        resource = await createYouTubePlayDlResource(next.url, startOffsetSec);
-        queue.textChannel?.send(
-          `Usando fallback de reproduccion para **${next.title}** (${shortErrorMessage(primaryPlaybackError, 90)}).`
-        ).catch(() => {});
-      } catch (fallbackError) {
-        throw new Error(
-          `Fallo url directa (${shortErrorMessage(primaryPlaybackError, 120)}). `
-          + `Fallo stream fallback (${shortErrorMessage(fallbackError, 120)}).`
-        );
-      }
-    }
+    const resource = createAudioResource(transcoder.stdout, {
+      inputType: StreamType.Raw,
+    });
     queue.ignoreAbortErrors = false;
     queue.player.play(resource);
     queue.playing = true;
@@ -1478,7 +1250,7 @@ async function playNext(guildId) {
       return;
     }
     const hint = buildPlaybackErrorHint(err);
-    const detail = shortErrorMessage(err, 220);
+    const detail = String(err?.message || err || 'sin detalle').replace(/\s+/g, ' ').trim().slice(0, 220);
     queue.textChannel?.send(
       `No pude reproducir **${next?.title || 'esa pista'}**. ${hint}\nDetalle: \`${detail}\``
     );
