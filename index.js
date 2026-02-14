@@ -21,6 +21,7 @@ const {
 } = require('@discordjs/voice');
 const playdl = require('play-dl');
 const ytDlp = require('yt-dlp-exec');
+const fs = require('node:fs');
 let ytdlCore = null;
 try {
   ytdlCore = require('@distube/ytdl-core');
@@ -44,7 +45,13 @@ const HISTORY_LIMIT = 50;
 const QUEUE_IDLE_DISCONNECT_MS = Math.max(0, Number(process.env.QUEUE_IDLE_DISCONNECT_SECONDS || 180)) * 1000;
 const SYSTEM_FFMPEG_PATH = process.env.FFMPEG_PATH || ffmpegPath || 'ffmpeg';
 const SYSTEM_YTDLP_PATH = process.env.YTDLP_PATH || process.env.YOUTUBE_DL_FILENAME || 'yt-dlp';
+const YTDLP_EXTRACTOR_ARGS = String(process.env.YTDLP_EXTRACTOR_ARGS || 'youtube:player_client=android').trim();
+const YTDLP_COOKIES_PATH = String(process.env.YTDLP_COOKIES_PATH || '/tmp/youtube-cookies.txt').trim();
+const YTDLP_COOKIES_BASE64 = String(process.env.YTDLP_COOKIES_BASE64 || '').trim();
+const YTDLP_COOKIES = String(process.env.YTDLP_COOKIES || '').trim();
+const YOUTUBE_COOKIE_HEADER = String(process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIE_HEADER || '').trim();
 const execFileAsync = promisify(execFile);
+let ytDlpCookieFilePath = '';
 
 if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
@@ -398,18 +405,67 @@ function createTranscoder(inputUrl, startOffsetSec = 0) {
   );
 }
 
-async function runYtDlpWithFallback(target, options) {
+function ensureYtDlpCookiesFile() {
+  if (ytDlpCookieFilePath) return ytDlpCookieFilePath;
+
+  if (YTDLP_COOKIES_BASE64) {
+    try {
+      const decoded = Buffer.from(YTDLP_COOKIES_BASE64, 'base64').toString('utf8').trim();
+      if (decoded) {
+        fs.writeFileSync(YTDLP_COOKIES_PATH, decoded, { encoding: 'utf8', mode: 0o600 });
+        ytDlpCookieFilePath = YTDLP_COOKIES_PATH;
+        return ytDlpCookieFilePath;
+      }
+    } catch (error) {
+      console.warn('[YouTube] No pude decodificar YTDLP_COOKIES_BASE64:', error?.message || error);
+    }
+  }
+
+  if (YTDLP_COOKIES) {
+    try {
+      fs.writeFileSync(YTDLP_COOKIES_PATH, YTDLP_COOKIES, { encoding: 'utf8', mode: 0o600 });
+      ytDlpCookieFilePath = YTDLP_COOKIES_PATH;
+      return ytDlpCookieFilePath;
+    } catch (error) {
+      console.warn('[YouTube] No pude escribir YTDLP_COOKIES:', error?.message || error);
+    }
+  }
+
   try {
-    return await ytDlp(target, options);
+    if (YTDLP_COOKIES_PATH && fs.existsSync(YTDLP_COOKIES_PATH)) {
+      ytDlpCookieFilePath = YTDLP_COOKIES_PATH;
+      return ytDlpCookieFilePath;
+    }
+  } catch {
+    // ignore fs checks
+  }
+
+  return '';
+}
+
+async function runYtDlpWithFallback(target, options) {
+  const cookiesPath = ensureYtDlpCookiesFile();
+  const mergedOptions = { ...(options || {}) };
+  if (YTDLP_EXTRACTOR_ARGS && !mergedOptions.extractorArgs) {
+    mergedOptions.extractorArgs = YTDLP_EXTRACTOR_ARGS;
+  }
+  if (cookiesPath && !mergedOptions.cookies) {
+    mergedOptions.cookies = cookiesPath;
+  }
+
+  try {
+    return await ytDlp(target, mergedOptions);
   } catch (primaryError) {
     const args = [];
-    if (options?.g) args.push('-g');
-    if (options?.f) args.push('-f', String(options.f));
-    if (options?.dumpSingleJson) args.push('--dump-single-json');
-    if (options?.flatPlaylist) args.push('--flat-playlist');
-    if (options?.skipDownload) args.push('--skip-download');
-    if (options?.noWarnings) args.push('--no-warnings');
-    if (options?.noPlaylist) args.push('--no-playlist');
+    if (mergedOptions?.g) args.push('-g');
+    if (mergedOptions?.f) args.push('-f', String(mergedOptions.f));
+    if (mergedOptions?.dumpSingleJson) args.push('--dump-single-json');
+    if (mergedOptions?.flatPlaylist) args.push('--flat-playlist');
+    if (mergedOptions?.skipDownload) args.push('--skip-download');
+    if (mergedOptions?.noWarnings) args.push('--no-warnings');
+    if (mergedOptions?.noPlaylist) args.push('--no-playlist');
+    if (YTDLP_EXTRACTOR_ARGS) args.push('--extractor-args', YTDLP_EXTRACTOR_ARGS);
+    if (cookiesPath) args.push('--cookies', cookiesPath);
     args.push(String(target));
 
     const { stdout } = await execFileAsync(SYSTEM_YTDLP_PATH, args, {
@@ -428,7 +484,18 @@ async function getDirectAudioUrlFromYouTubeCore(videoUrl) {
     throw new Error('ytdl-core no disponible');
   }
 
-  const info = await ytdlCore.getInfo(videoUrl);
+  const info = await ytdlCore.getInfo(
+    videoUrl,
+    YOUTUBE_COOKIE_HEADER
+      ? {
+        requestOptions: {
+          headers: {
+            cookie: YOUTUBE_COOKIE_HEADER,
+          },
+        },
+      }
+      : undefined
+  );
   const formats = Array.isArray(info?.formats) ? info.formats : [];
   const candidates = formats
     .filter((format) => format?.hasAudio && isValidUrl(format?.url))
@@ -486,7 +553,39 @@ function buildPlaybackErrorHint(error) {
   if (raw.includes('403') || raw.includes('429')) {
     return 'La fuente rechazo temporalmente la reproduccion (rate limit o bloqueo).';
   }
+  if (raw.includes("sign in to confirm you're not a bot") || raw.includes('confirm you’re not a bot')) {
+    return 'YouTube esta bloqueando la IP del servidor. Configura cookies de YouTube (YTDLP_COOKIES_BASE64 o YOUTUBE_COOKIE).';
+  }
   return 'Revisa logs del deploy para el detalle tecnico.';
+}
+
+function shortErrorMessage(error, max = 180) {
+  const text = String(error?.message || error || '').replace(/\s+/g, ' ').trim();
+  if (!text) return 'sin detalle';
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(1, max - 3))}...`;
+}
+
+async function createYouTubePlayDlResource(videoUrl, startOffsetSec = 0) {
+  const seek = Math.max(0, Number(startOffsetSec) || 0);
+  const streamData = await playdl.stream(videoUrl, {
+    discordPlayerCompatibility: true,
+    quality: 2,
+    seek,
+    requestOptions: YOUTUBE_COOKIE_HEADER
+      ? {
+        headers: {
+          cookie: YOUTUBE_COOKIE_HEADER,
+        },
+      }
+      : undefined,
+  });
+  if (!streamData?.stream) {
+    throw new Error('play-dl no devolvio un stream valido.');
+  }
+  return createAudioResource(streamData.stream, {
+    inputType: streamData.type ?? StreamType.Arbitrary,
+  });
 }
 
 function splitForDiscord(text, maxLength = 1900) {
@@ -1241,49 +1340,71 @@ async function playNext(guildId) {
     }
     next.attempts = (next.attempts || 0) + 1;
     const startOffsetSec = Math.max(0, Number(next.startOffsetSec) || 0);
-    const directUrl = (!next.isLive && next.prefetchedUrl)
-      ? next.prefetchedUrl
-      : await getDirectAudioUrl(next.url);
-    stopTranscoder(queue);
-    const transcoder = createTranscoder(directUrl, startOffsetSec);
-    queue.transcoder = transcoder;
+    let resource;
+    try {
+      const directUrl = (!next.isLive && next.prefetchedUrl)
+        ? next.prefetchedUrl
+        : await getDirectAudioUrl(next.url);
+      stopTranscoder(queue);
+      const transcoder = createTranscoder(directUrl, startOffsetSec);
+      queue.transcoder = transcoder;
 
-    transcoder.on('error', (err) => {
-      if (queue.transcoder !== transcoder) return;
-      console.error('Transcoder error:', err.message);
-      queue.player.stop();
-    });
-
-    transcoder.stderr.on('data', () => {
-      // stderr is noisy in ffmpeg; keep process alive and rely on close/error events.
-    });
-
-    transcoder.on('close', (code) => {
-      if (queue.transcoder !== transcoder) return;
-      if (queue.playing && code !== 0) {
-        if (!queue.ignoreAbortErrors) {
-          const snapshot = queue.nowPlaying ? cloneTrack(queue.nowPlaying) : cloneTrack(next);
-          const attempts = Number(snapshot?.attempts || next?.attempts || 1);
-          if (snapshot && attempts < 2) {
-            snapshot.prefetchedUrl = null;
-            queue.tracks.unshift(snapshot);
-            queue.suppressHistoryOnce = true;
-            queue.textChannel?.send(
-              `ffmpeg corto la reproduccion, reintentando: **${snapshot.title}** (${attempts}/2)`
-            ).catch(() => {});
-          } else {
-            queue.textChannel?.send(
-              `No pude decodificar el audio (${code}).`
-            ).catch(() => {});
-          }
-        }
+      transcoder.on('error', (err) => {
+        if (queue.transcoder !== transcoder) return;
+        console.error('Transcoder error:', err.message);
         queue.player.stop();
-      }
-    });
+      });
 
-    const resource = createAudioResource(transcoder.stdout, {
-      inputType: StreamType.Raw,
-    });
+      transcoder.stderr.on('data', () => {
+        // stderr is noisy in ffmpeg; keep process alive and rely on close/error events.
+      });
+
+      transcoder.on('close', (code) => {
+        if (queue.transcoder !== transcoder) return;
+        if (queue.playing && code !== 0) {
+          if (!queue.ignoreAbortErrors) {
+            const snapshot = queue.nowPlaying ? cloneTrack(queue.nowPlaying) : cloneTrack(next);
+            const attempts = Number(snapshot?.attempts || next?.attempts || 1);
+            if (snapshot && attempts < 2) {
+              snapshot.prefetchedUrl = null;
+              queue.tracks.unshift(snapshot);
+              queue.suppressHistoryOnce = true;
+              queue.textChannel?.send(
+                `ffmpeg corto la reproduccion, reintentando: **${snapshot.title}** (${attempts}/2)`
+              ).catch(() => {});
+            } else {
+              queue.textChannel?.send(
+                `No pude decodificar el audio (${code}).`
+              ).catch(() => {});
+            }
+          }
+          queue.player.stop();
+        }
+      });
+
+      resource = createAudioResource(transcoder.stdout, {
+        inputType: StreamType.Raw,
+      });
+    } catch (primaryPlaybackError) {
+      stopTranscoder(queue);
+      queue.transcoder = null;
+
+      if (!isYouTubeUrl(next.url)) {
+        throw primaryPlaybackError;
+      }
+
+      try {
+        resource = await createYouTubePlayDlResource(next.url, startOffsetSec);
+        queue.textChannel?.send(
+          `Usando fallback de reproduccion para **${next.title}** (${shortErrorMessage(primaryPlaybackError, 90)}).`
+        ).catch(() => {});
+      } catch (fallbackError) {
+        throw new Error(
+          `Fallo url directa (${shortErrorMessage(primaryPlaybackError, 120)}). `
+          + `Fallo stream fallback (${shortErrorMessage(fallbackError, 120)}).`
+        );
+      }
+    }
     queue.ignoreAbortErrors = false;
     queue.player.play(resource);
     queue.playing = true;
@@ -1316,8 +1437,9 @@ async function playNext(guildId) {
       return;
     }
     const hint = buildPlaybackErrorHint(err);
+    const detail = shortErrorMessage(err, 220);
     queue.textChannel?.send(
-      `No pude reproducir **${next?.title || 'esa pista'}**. ${hint}`
+      `No pude reproducir **${next?.title || 'esa pista'}**. ${hint}\nDetalle: \`${detail}\``
     );
     await playNext(guildId);
   }
