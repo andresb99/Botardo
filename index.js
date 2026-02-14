@@ -52,6 +52,7 @@ const YTDLP_COOKIES = String(process.env.YTDLP_COOKIES || '').trim();
 const YOUTUBE_COOKIE_HEADER = String(process.env.YOUTUBE_COOKIE || process.env.YOUTUBE_COOKIE_HEADER || '').trim();
 const execFileAsync = promisify(execFile);
 let ytDlpCookieFilePath = '';
+let ytCookieHeaderFromFile = '';
 
 if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
@@ -405,6 +406,31 @@ function createTranscoder(inputUrl, startOffsetSec = 0) {
   );
 }
 
+function parseNetscapeCookiesToHeader(rawText) {
+  const lines = String(rawText || '').split(/\r?\n/);
+  const pairs = new Map();
+
+  for (const line of lines) {
+    const row = String(line || '').trim();
+    if (!row || row.startsWith('#')) continue;
+    const parts = row.split('\t');
+    if (parts.length < 7) continue;
+    const domain = String(parts[0] || '').toLowerCase();
+    const name = String(parts[5] || '').trim();
+    const value = String(parts[6] || '').trim();
+    if (!name || !value) continue;
+    if (!domain.includes('youtube.com') && !domain.includes('google.com')) continue;
+    pairs.set(name, value);
+  }
+
+  if (!pairs.size) return '';
+  return Array.from(pairs.entries()).map(([name, value]) => `${name}=${value}`).join('; ');
+}
+
+function getYouTubeCookieHeader() {
+  return YOUTUBE_COOKIE_HEADER || ytCookieHeaderFromFile || '';
+}
+
 function ensureYtDlpCookiesFile() {
   if (ytDlpCookieFilePath) return ytDlpCookieFilePath;
 
@@ -412,6 +438,7 @@ function ensureYtDlpCookiesFile() {
     try {
       const decoded = Buffer.from(YTDLP_COOKIES_BASE64, 'base64').toString('utf8').trim();
       if (decoded) {
+        ytCookieHeaderFromFile = parseNetscapeCookiesToHeader(decoded);
         fs.writeFileSync(YTDLP_COOKIES_PATH, decoded, { encoding: 'utf8', mode: 0o600 });
         ytDlpCookieFilePath = YTDLP_COOKIES_PATH;
         return ytDlpCookieFilePath;
@@ -423,6 +450,7 @@ function ensureYtDlpCookiesFile() {
 
   if (YTDLP_COOKIES) {
     try {
+      ytCookieHeaderFromFile = parseNetscapeCookiesToHeader(YTDLP_COOKIES);
       fs.writeFileSync(YTDLP_COOKIES_PATH, YTDLP_COOKIES, { encoding: 'utf8', mode: 0o600 });
       ytDlpCookieFilePath = YTDLP_COOKIES_PATH;
       return ytDlpCookieFilePath;
@@ -433,6 +461,12 @@ function ensureYtDlpCookiesFile() {
 
   try {
     if (YTDLP_COOKIES_PATH && fs.existsSync(YTDLP_COOKIES_PATH)) {
+      try {
+        const raw = fs.readFileSync(YTDLP_COOKIES_PATH, 'utf8');
+        ytCookieHeaderFromFile = parseNetscapeCookiesToHeader(raw);
+      } catch {
+        // ignore local read issues
+      }
       ytDlpCookieFilePath = YTDLP_COOKIES_PATH;
       return ytDlpCookieFilePath;
     }
@@ -445,12 +479,16 @@ function ensureYtDlpCookiesFile() {
 
 async function runYtDlpWithFallback(target, options) {
   const cookiesPath = ensureYtDlpCookiesFile();
+  const cookieHeader = getYouTubeCookieHeader();
   const mergedOptions = { ...(options || {}) };
   if (YTDLP_EXTRACTOR_ARGS && !mergedOptions.extractorArgs) {
     mergedOptions.extractorArgs = YTDLP_EXTRACTOR_ARGS;
   }
   if (cookiesPath && !mergedOptions.cookies) {
     mergedOptions.cookies = cookiesPath;
+  }
+  if (!cookiesPath && cookieHeader && !mergedOptions.addHeader) {
+    mergedOptions.addHeader = [`Cookie: ${cookieHeader}`];
   }
 
   try {
@@ -466,6 +504,7 @@ async function runYtDlpWithFallback(target, options) {
     if (mergedOptions?.noPlaylist) args.push('--no-playlist');
     if (YTDLP_EXTRACTOR_ARGS) args.push('--extractor-args', YTDLP_EXTRACTOR_ARGS);
     if (cookiesPath) args.push('--cookies', cookiesPath);
+    if (!cookiesPath && cookieHeader) args.push('--add-header', `Cookie: ${cookieHeader}`);
     args.push(String(target));
 
     const { stdout } = await execFileAsync(SYSTEM_YTDLP_PATH, args, {
@@ -483,14 +522,15 @@ async function getDirectAudioUrlFromYouTubeCore(videoUrl) {
   if (!ytdlCore || typeof ytdlCore.getInfo !== 'function') {
     throw new Error('ytdl-core no disponible');
   }
+  const cookieHeader = getYouTubeCookieHeader();
 
   const info = await ytdlCore.getInfo(
     videoUrl,
-    YOUTUBE_COOKIE_HEADER
+    cookieHeader
       ? {
         requestOptions: {
           headers: {
-            cookie: YOUTUBE_COOKIE_HEADER,
+            cookie: cookieHeader,
           },
         },
       }
@@ -568,14 +608,15 @@ function shortErrorMessage(error, max = 180) {
 
 async function createYouTubePlayDlResource(videoUrl, startOffsetSec = 0) {
   const seek = Math.max(0, Number(startOffsetSec) || 0);
+  const cookieHeader = getYouTubeCookieHeader();
   const streamData = await playdl.stream(videoUrl, {
     discordPlayerCompatibility: true,
     quality: 2,
     seek,
-    requestOptions: YOUTUBE_COOKIE_HEADER
+    requestOptions: cookieHeader
       ? {
         headers: {
-          cookie: YOUTUBE_COOKIE_HEADER,
+          cookie: cookieHeader,
         },
       }
       : undefined,
