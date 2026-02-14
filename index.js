@@ -21,7 +21,8 @@ const {
 } = require('@discordjs/voice');
 const playdl = require('play-dl');
 const ytDlp = require('yt-dlp-exec');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
+const { promisify } = require('util');
 const ffmpegPath = require('ffmpeg-static');
 const { handleCommand } = require('./src/command-handler');
 const { PokemonMiniGame } = require('./src/pokemon-game');
@@ -35,6 +36,9 @@ const SPOTIFY_MARKET = process.env.SPOTIFY_MARKET || 'US';
 const SPOTIFY_MAX_TRACKS = Math.max(1, Math.min(1000, Number(process.env.SPOTIFY_MAX_TRACKS || 500)));
 const HISTORY_LIMIT = 50;
 const QUEUE_IDLE_DISCONNECT_MS = Math.max(0, Number(process.env.QUEUE_IDLE_DISCONNECT_SECONDS || 180)) * 1000;
+const SYSTEM_FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
+const SYSTEM_YTDLP_PATH = process.env.YTDLP_PATH || process.env.YOUTUBE_DL_FILENAME || 'yt-dlp';
+const execFileAsync = promisify(execFile);
 
 if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
@@ -355,9 +359,7 @@ function scheduleIdleDisconnect(guildId, queue) {
 }
 
 function createTranscoder(inputUrl, startOffsetSec = 0) {
-  if (!ffmpegPath) {
-    throw new Error('No se encontro ffmpeg. Verifica ffmpeg-static.');
-  }
+  const ffmpegBinary = ffmpegPath || SYSTEM_FFMPEG_PATH;
 
   const offset = Number(startOffsetSec);
   const args = [
@@ -381,7 +383,7 @@ function createTranscoder(inputUrl, startOffsetSec = 0) {
   );
 
   return spawn(
-    ffmpegPath,
+    ffmpegBinary,
     args,
     {
       windowsHide: true,
@@ -390,8 +392,33 @@ function createTranscoder(inputUrl, startOffsetSec = 0) {
   );
 }
 
+async function runYtDlpWithFallback(target, options) {
+  try {
+    return await ytDlp(target, options);
+  } catch (primaryError) {
+    const args = [];
+    if (options?.g) args.push('-g');
+    if (options?.f) args.push('-f', String(options.f));
+    if (options?.dumpSingleJson) args.push('--dump-single-json');
+    if (options?.flatPlaylist) args.push('--flat-playlist');
+    if (options?.skipDownload) args.push('--skip-download');
+    if (options?.noWarnings) args.push('--no-warnings');
+    if (options?.noPlaylist) args.push('--no-playlist');
+    args.push(String(target));
+
+    const { stdout } = await execFileAsync(SYSTEM_YTDLP_PATH, args, {
+      maxBuffer: 64 * 1024 * 1024,
+      windowsHide: true,
+    });
+    if (!String(stdout || '').trim()) {
+      throw primaryError;
+    }
+    return stdout;
+  }
+}
+
 async function getDirectAudioUrl(videoUrl) {
-  const output = await ytDlp(videoUrl, {
+  const output = await runYtDlpWithFallback(videoUrl, {
     g: true,
     f: 'bestaudio/best',
     noPlaylist: true,
@@ -972,7 +999,7 @@ async function resolveYouTubePlaylistTracksViaYtDlp(url, requestedBy) {
   if (!isYouTubePlaylistLikeUrl(url)) return [];
 
   try {
-    const output = await ytDlp(url, {
+    const output = await runYtDlpWithFallback(url, {
       dumpSingleJson: true,
       flatPlaylist: true,
       skipDownload: true,
@@ -1014,7 +1041,7 @@ async function resolveDirectMediaTrack(url, requestedBy) {
   if (!isValidUrl(url) || isSpotifyUrl(url)) return [];
 
   try {
-    const output = await ytDlp(url, {
+    const output = await runYtDlpWithFallback(url, {
       dumpSingleJson: true,
       skipDownload: true,
       noWarnings: true,
