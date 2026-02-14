@@ -21,6 +21,12 @@ const {
 } = require('@discordjs/voice');
 const playdl = require('play-dl');
 const ytDlp = require('yt-dlp-exec');
+let ytdlCore = null;
+try {
+  ytdlCore = require('@distube/ytdl-core');
+} catch {
+  ytdlCore = null;
+}
 const { spawn, execFile } = require('child_process');
 const { promisify } = require('util');
 const ffmpegPath = require('ffmpeg-static');
@@ -36,7 +42,7 @@ const SPOTIFY_MARKET = process.env.SPOTIFY_MARKET || 'US';
 const SPOTIFY_MAX_TRACKS = Math.max(1, Math.min(1000, Number(process.env.SPOTIFY_MAX_TRACKS || 500)));
 const HISTORY_LIMIT = 50;
 const QUEUE_IDLE_DISCONNECT_MS = Math.max(0, Number(process.env.QUEUE_IDLE_DISCONNECT_SECONDS || 180)) * 1000;
-const SYSTEM_FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
+const SYSTEM_FFMPEG_PATH = process.env.FFMPEG_PATH || ffmpegPath || 'ffmpeg';
 const SYSTEM_YTDLP_PATH = process.env.YTDLP_PATH || process.env.YOUTUBE_DL_FILENAME || 'yt-dlp';
 const execFileAsync = promisify(execFile);
 
@@ -359,7 +365,7 @@ function scheduleIdleDisconnect(guildId, queue) {
 }
 
 function createTranscoder(inputUrl, startOffsetSec = 0) {
-  const ffmpegBinary = ffmpegPath || SYSTEM_FFMPEG_PATH;
+  const ffmpegBinary = SYSTEM_FFMPEG_PATH;
 
   const offset = Number(startOffsetSec);
   const args = [
@@ -417,18 +423,51 @@ async function runYtDlpWithFallback(target, options) {
   }
 }
 
-async function getDirectAudioUrl(videoUrl) {
-  const output = await runYtDlpWithFallback(videoUrl, {
-    g: true,
-    f: 'bestaudio/best',
-    noPlaylist: true,
-    noWarnings: true,
-  });
-  const directUrl = String(output).split(/\r?\n/).find((line) => line.trim());
-  if (!isValidUrl(directUrl)) {
-    throw new Error('No se pudo obtener una URL directa valida.');
+async function getDirectAudioUrlFromYouTubeCore(videoUrl) {
+  if (!ytdlCore || typeof ytdlCore.getInfo !== 'function') {
+    throw new Error('ytdl-core no disponible');
   }
-  return directUrl.trim();
+
+  const info = await ytdlCore.getInfo(videoUrl);
+  const formats = Array.isArray(info?.formats) ? info.formats : [];
+  const candidates = formats
+    .filter((format) => format?.hasAudio && isValidUrl(format?.url))
+    .sort((left, right) => {
+      const leftScore = Number(left?.audioBitrate || 0) + (left?.hasVideo ? 0 : 1000);
+      const rightScore = Number(right?.audioBitrate || 0) + (right?.hasVideo ? 0 : 1000);
+      return rightScore - leftScore;
+    });
+
+  const best = candidates[0];
+  if (!isValidUrl(best?.url)) {
+    throw new Error('No se encontro un formato de audio valido en ytdl-core');
+  }
+  return String(best.url).trim();
+}
+
+async function getDirectAudioUrl(videoUrl) {
+  try {
+    const output = await runYtDlpWithFallback(videoUrl, {
+      g: true,
+      f: 'bestaudio/best',
+      noPlaylist: true,
+      noWarnings: true,
+    });
+    const directUrl = String(output).split(/\r?\n/).find((line) => line.trim());
+    if (isValidUrl(directUrl)) {
+      return directUrl.trim();
+    }
+  } catch (error) {
+    if (!isYouTubeUrl(videoUrl)) {
+      throw error;
+    }
+  }
+
+  if (isYouTubeUrl(videoUrl)) {
+    return await getDirectAudioUrlFromYouTubeCore(videoUrl);
+  }
+
+  throw new Error('No se pudo obtener una URL directa valida.');
 }
 
 function buildPlaybackErrorHint(error) {
@@ -441,7 +480,7 @@ function buildPlaybackErrorHint(error) {
   ) {
     return 'Parece que falta `yt-dlp` en el host o no esta en PATH.';
   }
-  if (raw.includes('ffmpeg')) {
+  if (raw.includes('ffmpeg') || raw.includes('invalid data found') || raw.includes('error while decoding')) {
     return 'Parece que `ffmpeg` no esta disponible correctamente en el host.';
   }
   if (raw.includes('403') || raw.includes('429')) {
@@ -1222,6 +1261,22 @@ async function playNext(guildId) {
     transcoder.on('close', (code) => {
       if (queue.transcoder !== transcoder) return;
       if (queue.playing && code !== 0) {
+        if (!queue.ignoreAbortErrors) {
+          const snapshot = queue.nowPlaying ? cloneTrack(queue.nowPlaying) : cloneTrack(next);
+          const attempts = Number(snapshot?.attempts || next?.attempts || 1);
+          if (snapshot && attempts < 2) {
+            snapshot.prefetchedUrl = null;
+            queue.tracks.unshift(snapshot);
+            queue.suppressHistoryOnce = true;
+            queue.textChannel?.send(
+              `ffmpeg corto la reproduccion, reintentando: **${snapshot.title}** (${attempts}/2)`
+            ).catch(() => {});
+          } else {
+            queue.textChannel?.send(
+              `No pude decodificar el audio (${code}).`
+            ).catch(() => {});
+          }
+        }
         queue.player.stop();
       }
     });
