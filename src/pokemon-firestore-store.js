@@ -36,7 +36,6 @@ class FirestorePokemonStore {
   async loadPlayer(guildId, userId) {
     const playerRef = this.playerDoc(guildId, userId);
     const playerSnap = await playerRef.get();
-    if (!playerSnap.exists) return null;
 
     let pokemonSnap;
     try {
@@ -48,8 +47,12 @@ class FirestorePokemonStore {
     const collection = pokemonSnap.docs.map((doc) => doc.data());
     collection.sort((left, right) => (Number(left?.capturedAt || 0) - Number(right?.capturedAt || 0)));
 
+    if (!playerSnap.exists && !collection.length) {
+      return null;
+    }
+
     return {
-      profile: playerSnap.data() || {},
+      profile: playerSnap.exists ? (playerSnap.data() || {}) : {},
       collection,
     };
   }

@@ -114,13 +114,13 @@ npm test
 - `!pause`: Pause playback.
 - `!resume`: Resume playback.
 - `!queue`: Show current track and queued tracks.
-- `!allqueue` / `!all queue`: Show full session list (history + current + pending).
+- `!allqueue` / `!all queue`: Show full session list (history + current + pending) in a paginated card with buttons.
 - `!ask <question>`: Ask Gemini and reply in chat.
 - `!pokehelp`: Show Pokemon mini-game commands.
 - `!pokepulls`: Show your available Pokemon pulls and daily cooldown.
 - `!pokedaily`: Claim daily pulls.
 - `!pokepull <amount>`: Roll random Pokemon with weighted rarity odds. Single pull shows image; multi-pull opens a button carousel.
-- `!pokeinv [page]`: Show your Pokemon inventory in a visual carousel.
+- `!pokeinv [page|@user [page]]`: Show your inventory or inspect another user's Pokemon inventory in a visual carousel.
 - `!poketeam`: Show current team slots.
 - `!poketeam set <slot> <PKxxxx>`: Assign a captured Pokemon to team slot.
 - `!poketeam clear <slot>`: Clear a team slot.
@@ -169,6 +169,7 @@ Queue position notes:
 !remove 14
 !timeskip 45
 !pokepull 3
+!pokeinv @friend 2
 !evolve PK0001
 !pokestore 1 potion
 !pokebuy potion 250

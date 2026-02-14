@@ -667,18 +667,14 @@ test('queue command: prints current and pending tracks in one ordered list', asy
   assert.match(replies[0], /3\. \[LIVE\] Song C/);
 });
 
-test('allqueue command: prints history plus full current queue', async () => {
+test('allqueue command: renders paginated card with history and current queue', async () => {
   const { message, replies } = createMessage();
   const { queue } = createQueue({
     history: [{ title: 'Song X', isLive: false }],
     nowPlaying: { title: 'Song A', isLive: false },
     tracks: [{ title: 'Song B', isLive: false }],
   });
-  const { deps } = createDeps({
-    splitForDiscord(text) {
-      return [text];
-    },
-  });
+  const { deps } = createDeps();
 
   const handled = await handleCommand({
     command: 'allqueue',
@@ -689,25 +685,27 @@ test('allqueue command: prints history plus full current queue', async () => {
   });
 
   assert.equal(handled, true);
-  assert.match(replies[0], /Historial \(1\):/);
-  assert.match(replies[0], /1\. Song X/);
-  assert.match(replies[0], /Cola actual \(2\):/);
-  assert.match(replies[0], /1\. \[SONANDO\] Song A/);
-  assert.match(replies[0], /2\. Song B/);
+  assert.equal(typeof replies[0], 'object');
+  const embeds = Array.isArray(replies[0]?.embeds) ? replies[0].embeds : [];
+  assert.equal(embeds.length, 1);
+  const title = String(embeds[0]?.data?.title || '');
+  const description = String(embeds[0]?.data?.description || '');
+  assert.match(title, /Historial \+ Cola Completa/i);
+  assert.match(description, /H1\. Song X/i);
+  assert.match(description, /Q1\. \[SONANDO\] Song A/i);
+  assert.match(description, /Q2\. Song B/i);
+  const components = Array.isArray(replies[0]?.components) ? replies[0].components : [];
+  assert.ok(components.length > 0);
 });
 
-test('all queue alias: supports \"!all queue\"', async () => {
+test('all queue alias: supports \"!all queue\" with paginated payload', async () => {
   const { message, replies } = createMessage();
   const { queue } = createQueue({
     history: [],
     nowPlaying: { title: 'Song A', isLive: false },
     tracks: [],
   });
-  const { deps } = createDeps({
-    splitForDiscord(text) {
-      return [text];
-    },
-  });
+  const { deps } = createDeps();
 
   const handled = await handleCommand({
     command: 'all',
@@ -718,5 +716,8 @@ test('all queue alias: supports \"!all queue\"', async () => {
   });
 
   assert.equal(handled, true);
-  assert.match(replies[0], /Cola actual \(1\):/);
+  const embeds = Array.isArray(replies[0]?.embeds) ? replies[0].embeds : [];
+  assert.equal(embeds.length, 1);
+  const description = String(embeds[0]?.data?.description || '');
+  assert.match(description, /Q1\. \[SONANDO\] Song A/i);
 });

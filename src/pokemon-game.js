@@ -2693,7 +2693,7 @@ class PokemonMiniGame {
           '`!pokepulls` - ver tiradas disponibles',
           '`!pokedaily` - reclamar tiradas diarias',
           '`!pokepull <cantidad>` - tirar Pokemon al azar con rarezas',
-          '`!pokeinv [pagina]` - ver inventario visual',
+          '`!pokeinv [pagina|@usuario [pagina]]` - ver inventario visual',
           `\`!poketeam\` - ver equipo (${TEAM_SIZE} slots)`,
           '`!poketeam set <slot> <PKxxxx>` - asignar Pokemon al equipo',
           '`!poketeam clear <slot>` - limpiar slot',
@@ -3145,7 +3145,7 @@ class PokemonMiniGame {
     }
 
     if (interaction.user.id !== carousel.ownerId) {
-      await interaction.reply({ content: 'Solo dueno del inventario puede usar este carrusel.', ephemeral: true });
+      await interaction.reply({ content: 'Solo quien abrio este inventario puede usar este carrusel.', ephemeral: true });
       return;
     }
 
@@ -3176,15 +3176,119 @@ class PokemonMiniGame {
     await interaction.update(this.buildInventoryCarouselPayload(carousel));
   }
 
+  resolveGuildUserByReference(message, reference) {
+    const raw = String(reference || '').trim();
+    if (!raw) return null;
+
+    const mentionMatch = raw.match(/^<@!?(\d+)>$/);
+    const idCandidate = mentionMatch?.[1]
+      || (/^\d{15,25}$/.test(raw) ? raw : '');
+
+    if (idCandidate) {
+      const fromMention = message?.mentions?.users?.first?.();
+      if (fromMention && String(fromMention.id) === String(idCandidate)) {
+        return fromMention;
+      }
+
+      const fromMembers = message?.guild?.members?.cache?.get?.(idCandidate)?.user;
+      if (fromMembers) return fromMembers;
+
+      const fromClient = message?.client?.users?.cache?.get?.(idCandidate);
+      if (fromClient) return fromClient;
+    }
+
+    const query = normalizeSlug(raw.replace(/^@/, ''));
+    if (!query) return null;
+    const membersCache = message?.guild?.members?.cache;
+    if (!membersCache || typeof membersCache.values !== 'function') return null;
+
+    for (const member of membersCache.values()) {
+      const user = member?.user;
+      if (!user) continue;
+      const username = normalizeSlug(user.username || '');
+      const globalName = normalizeSlug(user.globalName || '');
+      const displayName = normalizeSlug(member.displayName || member.nickname || '');
+      if (query === username || query === globalName || query === displayName) {
+        return user;
+      }
+    }
+    return null;
+  }
+
+  parseInventoryViewArgs(args, message) {
+    const tokens = String(args || '').trim().split(/\s+/).filter(Boolean);
+    if (!tokens.length) {
+      return { targetUser: message.author, page: 1, targetReference: '' };
+    }
+
+    let page = 1;
+    let reference = '';
+
+    const mentionIndex = tokens.findIndex((token) => /^<@!?\d+>$/.test(token));
+    const idIndex = mentionIndex >= 0
+      ? mentionIndex
+      : tokens.findIndex((token) => /^\d{15,25}$/.test(token));
+
+    if (idIndex >= 0) {
+      reference = tokens[idIndex];
+      const remaining = tokens.filter((_, index) => index !== idIndex);
+      const pageToken = remaining.find((token) => /^\d+$/.test(token) && token.length < 15);
+      if (pageToken) page = Math.max(1, Math.floor(Number(pageToken)));
+    } else if (tokens.length === 1 && /^\d+$/.test(tokens[0]) && tokens[0].length < 15) {
+      page = Math.max(1, Math.floor(Number(tokens[0])));
+      reference = '';
+    } else if (tokens.length > 1 && /^\d+$/.test(tokens[tokens.length - 1]) && tokens[tokens.length - 1].length < 15) {
+      page = Math.max(1, Math.floor(Number(tokens[tokens.length - 1])));
+      reference = tokens.slice(0, -1).join(' ');
+    } else if (tokens.length === 2 && /^\d+$/.test(tokens[0]) && tokens[0].length < 15) {
+      page = Math.max(1, Math.floor(Number(tokens[0])));
+      reference = tokens[1];
+    } else {
+      reference = tokens.join(' ');
+    }
+
+    if (!reference) {
+      return { targetUser: message.author, page, targetReference: '' };
+    }
+
+    const targetUser = this.resolveGuildUserByReference(message, reference);
+    if (!targetUser) {
+      return {
+        targetUser: null,
+        page,
+        targetReference: reference,
+        error: `No encontre a **${trimText(reference, 80)}** en este servidor.`,
+      };
+    }
+
+    return { targetUser, page, targetReference: reference };
+  }
+
   async handlePokeInventory({ args, message }) {
-    const profile = await this.ensureProfileLoaded(message.guild.id, message.author);
-    if (!profile.collection.length) {
-      await message.reply('Tu inventario Pokemon esta vacio. Usa `!pokepull`.');
+    const parsed = this.parseInventoryViewArgs(args, message);
+    if (parsed.error || !parsed.targetUser) {
+      const invalid = this.buildSystemEmbed({
+        title: 'Usuario no encontrado',
+        description: parsed.error || 'No pude resolver ese usuario.',
+        color: 0xff6b6b,
+      });
+      await message.reply({ embeds: [invalid] });
       return;
     }
 
-    const pageRaw = args ? Number(args.trim()) : 1;
-    const page = Number.isInteger(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+    const targetUser = parsed.targetUser;
+    const isOwnInventory = targetUser.id === message.author.id;
+    const profile = await this.ensureProfileLoaded(message.guild.id, targetUser);
+    if (!profile.collection.length) {
+      await message.reply(
+        isOwnInventory
+          ? 'Tu inventario Pokemon esta vacio. Usa `!pokepull`.'
+          : `El inventario Pokemon de **${targetUser.username}** esta vacio.`
+      );
+      return;
+    }
+
+    const page = Number.isInteger(parsed.page) && parsed.page > 0 ? parsed.page : 1;
     const perPage = 10;
     const items = profile.collection.slice().reverse();
     const maxPage = Math.max(1, Math.ceil(items.length / perPage));
@@ -3196,10 +3300,10 @@ class PokemonMiniGame {
         pokemon: items[0],
         index: 0,
         total: 1,
-        ownerName: message.author.username,
+        ownerName: targetUser.username,
       });
       await message.reply({
-        content: 'Inventario Pokemon (1)',
+        content: `Inventario Pokemon de ${targetUser.username} (1)`,
         embeds: [embed],
       });
       return;
@@ -3209,7 +3313,7 @@ class PokemonMiniGame {
     const carousel = {
       id: carouselId,
       ownerId: message.author.id,
-      ownerName: message.author.username,
+      ownerName: targetUser.username,
       guildId: message.guild.id,
       channelId: message.channel.id,
       items,
@@ -3223,7 +3327,7 @@ class PokemonMiniGame {
     this.inventoryCarousels.set(carouselId, carousel);
 
     const sent = await message.reply(this.buildInventoryCarouselPayload(carousel));
-    carousel.messageId = sent.id;
+    carousel.messageId = sent?.id || null;
   }
 
   async handlePokeTeam({ args, message }) {

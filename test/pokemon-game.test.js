@@ -51,13 +51,38 @@ function buildPokemonPayload(id, name, statsOverride = null) {
   };
 }
 
-function createPokemonCommandMessage({ userId = 'user-1', username = 'tester', guildId = 'guild-1' } = {}) {
+function createPokemonCommandMessage({
+  userId = 'user-1',
+  username = 'tester',
+  guildId = 'guild-1',
+  guildUsers = [],
+  mentionedUser = null,
+} = {}) {
   const replies = [];
   const typingCalls = { value: 0 };
+  const author = { id: userId, username };
+  const users = guildUsers.length ? guildUsers : [author];
+  const membersCache = new Map(
+    users.map((user) => [user.id, { user, displayName: user.username, nickname: null }])
+  );
+  if (!membersCache.has(author.id)) {
+    membersCache.set(author.id, { user: author, displayName: author.username, nickname: null });
+  }
+
   return {
     message: {
-      author: { id: userId, username },
-      guild: { id: guildId },
+      author,
+      guild: {
+        id: guildId,
+        members: {
+          cache: membersCache,
+        },
+      },
+      mentions: {
+        users: {
+          first: () => mentionedUser,
+        },
+      },
       channel: {
         async sendTyping() {
           typingCalls.value += 1;
@@ -633,6 +658,57 @@ test('pokedex command: accepts pokemon name input', async () => {
   const title = String(embeds[0]?.data?.title || '');
   assert.match(title, /#0001/i);
   assert.match(title, /Bulbasaur/i);
+});
+
+test('pokeinv command: can inspect another user inventory with mention', async () => {
+  const fetchImpl = buildEvolutionFetchMock();
+  const game = new PokemonMiniGame({ fetchImpl });
+  const viewer = { id: '100000000000000001', username: 'viewer' };
+  const target = { id: '100000000000000002', username: 'targetUser' };
+  const { message, replies } = createPokemonCommandMessage({
+    userId: viewer.id,
+    username: viewer.username,
+    guildUsers: [viewer, target],
+    mentionedUser: target,
+  });
+  const targetProfile = game.createEmptyProfile(target);
+  const template = await game.getPokemonTemplate('bulbasaur');
+  game.capturePokemon(targetProfile, template);
+  game.ensureGuildStore(message.guild.id).set(target.id, targetProfile);
+
+  const handled = await game.handleMessageCommand({
+    command: 'pokeinv',
+    args: `<@${target.id}>`,
+    message,
+  });
+
+  assert.equal(handled, true);
+  assert.ok(replies.length > 0);
+  const reply = replies[0];
+  assert.match(String(reply?.content || ''), /targetUser/i);
+  const embeds = Array.isArray(reply?.embeds) ? reply.embeds : [];
+  assert.equal(embeds.length, 1);
+  const description = String(embeds[0]?.data?.description || '');
+  assert.match(description, /Entrenador: \*\*targetUser\*\*/i);
+});
+
+test('pokeinv command: returns error when target user is not found', async () => {
+  const fetchImpl = buildEvolutionFetchMock();
+  const game = new PokemonMiniGame({ fetchImpl });
+  const { message, replies } = createPokemonCommandMessage();
+
+  const handled = await game.handleMessageCommand({
+    command: 'pokeinv',
+    args: '@usuario-que-no-existe 2',
+    message,
+  });
+
+  assert.equal(handled, true);
+  assert.ok(replies.length > 0);
+  const embeds = Array.isArray(replies[0]?.embeds) ? replies[0].embeds : [];
+  assert.equal(embeds.length, 1);
+  const title = String(embeds[0]?.data?.title || '');
+  assert.match(title, /Usuario no encontrado/i);
 });
 
 test('pokeuse command: uses rare candy and consumes item from bag', async () => {

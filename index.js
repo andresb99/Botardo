@@ -404,6 +404,25 @@ async function getDirectAudioUrl(videoUrl) {
   return directUrl.trim();
 }
 
+function buildPlaybackErrorHint(error) {
+  const raw = String(error?.message || '').toLowerCase();
+  if (
+    raw.includes('yt-dlp')
+    || raw.includes('youtube-dl')
+    || raw.includes('spawn')
+    || raw.includes('enoent')
+  ) {
+    return 'Parece que falta `yt-dlp` en el host o no esta en PATH.';
+  }
+  if (raw.includes('ffmpeg')) {
+    return 'Parece que `ffmpeg` no esta disponible correctamente en el host.';
+  }
+  if (raw.includes('403') || raw.includes('429')) {
+    return 'La fuente rechazo temporalmente la reproduccion (rate limit o bloqueo).';
+  }
+  return 'Revisa logs del deploy para el detalle tecnico.';
+}
+
 function splitForDiscord(text, maxLength = 1900) {
   if (!text) return [];
   const chunks = [];
@@ -1214,7 +1233,10 @@ async function playNext(guildId) {
       await playNext(guildId);
       return;
     }
-    queue.textChannel?.send('No pude reproducir esa pista.');
+    const hint = buildPlaybackErrorHint(err);
+    queue.textChannel?.send(
+      `No pude reproducir **${next?.title || 'esa pista'}**. ${hint}`
+    );
     await playNext(guildId);
   }
 }

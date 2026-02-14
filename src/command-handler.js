@@ -1,8 +1,36 @@
-function formatTrackLine(track, index, options = {}) {
+const {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ComponentType,
+  EmbedBuilder,
+} = require('discord.js');
+
+const ALL_QUEUE_PAGE_SIZE = 12;
+const ALL_QUEUE_TTL_MS = 5 * 60 * 1000;
+const ALL_QUEUE_BUTTONS = Object.freeze({
+  FIRST: 'allq:first',
+  PREV_TEN: 'allq:prev10',
+  PREV: 'allq:prev',
+  NEXT: 'allq:next',
+  NEXT_TEN: 'allq:next10',
+});
+
+function trimText(value, max = 180) {
+  const text = String(value || '');
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(1, max - 1))}...`;
+}
+
+function formatTrackLabel(track, options = {}) {
   const isNowPlaying = Boolean(options.isNowPlaying);
   const nowFlag = isNowPlaying ? '[SONANDO] ' : '';
   const liveFlag = track?.isLive ? '[LIVE] ' : '';
-  return `${index}. ${nowFlag}${liveFlag}${track?.title || 'Sin titulo'}`;
+  return `${nowFlag}${liveFlag}${trimText(track?.title || 'Sin titulo', 180)}`;
+}
+
+function formatTrackLine(track, index, options = {}) {
+  return `${index}. ${formatTrackLabel(track, options)}`;
 }
 
 function buildQueueItems(queue) {
@@ -16,35 +44,96 @@ function buildQueueItems(queue) {
   return items;
 }
 
-function buildAllQueueReport(queue) {
-  const history = queue.history || [];
-  const currentItems = buildQueueItems(queue);
+function clampPage(value, totalPages) {
+  if (totalPages <= 1) return 0;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed)) return 0;
+  return Math.max(0, Math.min(parsed, totalPages - 1));
+}
 
-  if (!history.length && !currentItems.length) {
-    return null;
-  }
+function buildAllQueueButtons(page, totalPages, forceDisabled = false) {
+  const atStart = page <= 0;
+  const atEnd = page >= totalPages - 1;
+  const disabled = forceDisabled || totalPages <= 1;
+
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(ALL_QUEUE_BUTTONS.FIRST)
+        .setEmoji('⏮️')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled || atStart),
+      new ButtonBuilder()
+        .setCustomId(ALL_QUEUE_BUTTONS.PREV_TEN)
+        .setLabel('-10')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled || atStart),
+      new ButtonBuilder()
+        .setCustomId(ALL_QUEUE_BUTTONS.PREV)
+        .setEmoji('◀️')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled || atStart),
+      new ButtonBuilder()
+        .setCustomId(ALL_QUEUE_BUTTONS.NEXT)
+        .setEmoji('▶️')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled || atEnd),
+      new ButtonBuilder()
+        .setCustomId(ALL_QUEUE_BUTTONS.NEXT_TEN)
+        .setLabel('+10')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled || atEnd)
+    ),
+  ];
+}
+
+function buildAllQueuePagePayload(queue, page, options = {}) {
+  const history = Array.isArray(queue?.history) ? queue.history : [];
+  const currentItems = buildQueueItems(queue || {});
+  const totalItems = history.length + currentItems.length;
+  const totalPages = Math.max(1, Math.ceil(totalItems / ALL_QUEUE_PAGE_SIZE));
+  const safePage = clampPage(page, totalPages);
+  const start = safePage * ALL_QUEUE_PAGE_SIZE;
+  const endExclusive = Math.min(totalItems, start + ALL_QUEUE_PAGE_SIZE);
 
   const lines = [];
-  lines.push(`Historial (${history.length}):`);
-  if (history.length) {
-    const historyLines = history.map((track, i) => formatTrackLine(track, i + 1));
-    lines.push(...historyLines);
-  } else {
-    lines.push('Sin pistas anteriores.');
+  for (let index = start; index < endExclusive; index += 1) {
+    if (index < history.length) {
+      const historyTrack = history[index];
+      lines.push(`H${index + 1}. ${formatTrackLabel(historyTrack)}`);
+      continue;
+    }
+
+    const currentIndex = index - history.length;
+    const item = currentItems[currentIndex];
+    lines.push(`Q${currentIndex + 1}. ${formatTrackLabel(item?.track, { isNowPlaying: item?.isNowPlaying })}`);
   }
 
-  lines.push('');
-  lines.push(`Cola actual (${currentItems.length}):`);
-  if (currentItems.length) {
-    const currentLines = currentItems.map((item, i) =>
-      formatTrackLine(item.track, i + 1, { isNowPlaying: item.isNowPlaying })
+  const startLabel = totalItems ? start + 1 : 0;
+  const endLabel = totalItems ? endExclusive : 0;
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('Historial + Cola Completa')
+    .setDescription(
+      totalItems
+        ? `Mostrando **${startLabel}-${endLabel}** de **${totalItems}** pistas.\nPrefijos: **H** = historial, **Q** = cola actual.\n\n${lines.join('\n')}`
+        : 'La cola esta vacia ahora mismo.'
+    )
+    .addFields(
+      { name: 'Historial', value: String(history.length), inline: true },
+      { name: 'Cola actual', value: String(currentItems.length), inline: true },
+      { name: 'Pagina', value: `${safePage + 1}/${totalPages}`, inline: true }
     );
-    lines.push(...currentLines);
-  } else {
-    lines.push('Sin canciones en cola.');
-  }
 
-  return lines.join('\n');
+  const components = buildAllQueueButtons(safePage, totalPages, Boolean(options.disabled));
+  return {
+    page: safePage,
+    totalPages,
+    payload: {
+      embeds: [embed],
+      components,
+    },
+  };
 }
 
 function formatSeconds(value) {
@@ -79,7 +168,7 @@ function buildHelpText() {
     '`!prev` - volver a la pista anterior',
     '`!pause` / `!resume` - pausar o reanudar',
     '`!queue` - ver cola resumida',
-    '`!allqueue` (`!all queue`) - ver historial + cola completa',
+    '`!allqueue` (`!all queue`) - ver historial + cola completa (paginada)',
     '`!clear` - limpiar pendientes',
     '`!stop` - detener y desconectar',
     '`!ask <pregunta>` - consultar Gemini',
@@ -577,16 +666,78 @@ async function handleCommand({ command, args, message, queue, deps }) {
   }
 
   if (command === 'allqueue' || (command === 'all' && args.toLowerCase() === 'queue')) {
-    const report = buildAllQueueReport(queue);
-    if (!report) {
+    const totalItems =
+      (Array.isArray(queue.history) ? queue.history.length : 0)
+      + buildQueueItems(queue).length;
+    if (!totalItems) {
       await message.reply('La cola esta vacia.');
       return true;
     }
 
-    const chunks = splitForDiscord(report, 1900);
-    for (const chunk of chunks) {
-      await message.reply(chunk);
+    let currentPage = 0;
+    const first = buildAllQueuePagePayload(queue, currentPage);
+    currentPage = first.page;
+    const sent = await message.reply(first.payload);
+
+    if (!sent || typeof sent.createMessageComponentCollector !== 'function') {
+      return true;
     }
+
+    const collector = sent.createMessageComponentCollector({
+      componentType: ComponentType.Button,
+      time: ALL_QUEUE_TTL_MS,
+    });
+
+    collector.on('collect', async (interaction) => {
+      try {
+        if (interaction.user?.id !== message.author?.id) {
+          await interaction.reply({
+            content: 'Este panel de cola lo controla quien ejecuto el comando.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        switch (interaction.customId) {
+          case ALL_QUEUE_BUTTONS.FIRST:
+            currentPage = 0;
+            break;
+          case ALL_QUEUE_BUTTONS.PREV_TEN:
+            currentPage = Math.max(0, currentPage - 10);
+            break;
+          case ALL_QUEUE_BUTTONS.PREV:
+            currentPage = Math.max(0, currentPage - 1);
+            break;
+          case ALL_QUEUE_BUTTONS.NEXT:
+            currentPage += 1;
+            break;
+          case ALL_QUEUE_BUTTONS.NEXT_TEN:
+            currentPage += 10;
+            break;
+          default:
+            await interaction.deferUpdate();
+            return;
+        }
+
+        const next = buildAllQueuePagePayload(queue, currentPage);
+        currentPage = next.page;
+        await interaction.update(next.payload);
+      } catch {
+        if (!interaction.replied && !interaction.deferred) {
+          await interaction.deferUpdate().catch(() => {});
+        }
+      }
+    });
+
+    collector.on('end', async () => {
+      try {
+        const finalPage = buildAllQueuePagePayload(queue, currentPage, { disabled: true });
+        await sent.edit(finalPage.payload);
+      } catch {
+        // no-op
+      }
+    });
+
     return true;
   }
 
