@@ -24,14 +24,17 @@ const ytDlp = require('yt-dlp-exec');
 const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 const { handleCommand } = require('./src/command-handler');
+const { PokemonMiniGame } = require('./src/pokemon-game');
+const { createFirestorePokemonStoreFromEnv } = require('./src/pokemon-firestore-store');
 
 const PREFIX = '!';
 const TOKEN = process.env.DISCORD_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 const SPOTIFY_MARKET = process.env.SPOTIFY_MARKET || 'US';
-const SPOTIFY_MAX_TRACKS = Number(process.env.SPOTIFY_MAX_TRACKS || 500);
+const SPOTIFY_MAX_TRACKS = Math.max(1, Math.min(1000, Number(process.env.SPOTIFY_MAX_TRACKS || 500)));
 const HISTORY_LIMIT = 50;
+const QUEUE_IDLE_DISCONNECT_MS = Math.max(0, Number(process.env.QUEUE_IDLE_DISCONNECT_SECONDS || 180)) * 1000;
 
 if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
@@ -49,6 +52,13 @@ const client = new Client({
 });
 
 const queues = new Map();
+const pokemonStore = createFirestorePokemonStoreFromEnv();
+if (!pokemonStore) {
+  console.log('[Pokemon] Persistencia en memoria activa (sin Firestore).');
+}
+const pokemonGame = new PokemonMiniGame({
+  persistence: pokemonStore,
+});
 const spotifyCache = {
   user: { accessToken: null, expiresAt: 0 },
   app: { accessToken: null, expiresAt: 0 },
@@ -64,14 +74,75 @@ function isValidUrl(value) {
   }
 }
 
+function sanitizeQueryInput(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return raw
+    .replace(/^<(.+)>$/, '$1')
+    .replace(/^`(.+)`$/, '$1')
+    .replace(/^"(.+)"$/, '$1')
+    .replace(/^'(.+)'$/, '$1')
+    .trim();
+}
+
 function isSpotifyUrl(value) {
-  if (!isValidUrl(value)) return false;
-  const host = new URL(value).hostname.toLowerCase();
+  const cleaned = sanitizeQueryInput(value);
+  if (!isValidUrl(cleaned)) return false;
+  const host = new URL(cleaned).hostname.toLowerCase();
   return host.includes('spotify.com');
 }
 
+function isSpotifyShortUrl(value) {
+  const cleaned = sanitizeQueryInput(value);
+  if (!isValidUrl(cleaned)) return false;
+  const host = new URL(cleaned).hostname.toLowerCase();
+  return host.includes('spotify.link') || host.includes('spoti.fi');
+}
+
+function isYouTubeUrl(value) {
+  const cleaned = sanitizeQueryInput(value);
+  if (!isValidUrl(cleaned)) return false;
+  const host = new URL(cleaned).hostname.toLowerCase();
+  return (
+    host === 'youtu.be' ||
+    host.endsWith('youtube.com') ||
+    host.endsWith('youtube-nocookie.com')
+  );
+}
+
+function isYouTubePlaylistLikeUrl(value) {
+  const cleaned = sanitizeQueryInput(value);
+  if (!isValidUrl(cleaned) || !isYouTubeUrl(cleaned)) return false;
+  const parsed = new URL(cleaned);
+  if (parsed.searchParams.get('list')) return true;
+  return /^\/playlist(?:\/|$)/i.test(parsed.pathname);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function resolveSpotifyRedirect(url) {
+  if (!isSpotifyShortUrl(url)) return url;
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; DiscordBot/1.0)',
+      },
+    });
+    if (isValidUrl(response.url)) {
+      return response.url;
+    }
+  } catch {
+    // ignore redirect resolution errors and keep original URL
+  }
+  return url;
+}
+
 function normalizeSpotifyInput(value) {
-  const raw = String(value || '').trim();
+  const raw = sanitizeQueryInput(value);
   const uriMatch = raw.match(/^spotify:(track|album|playlist):([A-Za-z0-9]+)$/i);
   if (uriMatch) {
     const type = uriMatch[1].toLowerCase();
@@ -94,7 +165,9 @@ function normalizeSpotifyInput(value) {
     return { isSpotify: false, url: raw, kind: null };
   }
 
-  const path = parsed.pathname.replace(/^\/intl-[^/]+/i, '');
+  const path = parsed.pathname
+    .replace(/^\/intl-[^/]+/i, '')
+    .replace(/^\/embed\//i, '/');
   let match = path.match(/^\/(track|album|playlist)\/([A-Za-z0-9]+)\/?$/i);
 
   if (!match) {
@@ -102,6 +175,16 @@ function normalizeSpotifyInput(value) {
     const legacy = path.match(/^\/user\/[^/]+\/playlist\/([A-Za-z0-9]+)\/?$/i);
     if (legacy) {
       match = ['playlist', 'playlist', legacy[1]];
+    }
+  }
+
+  if (!match) {
+    const loose = raw.match(/(?:track|album|playlist)[/:]([A-Za-z0-9]{22})/i);
+    if (loose) {
+      const typeMatch = raw.match(/(track|album|playlist)/i);
+      if (typeMatch) {
+        match = [typeMatch[1], typeMatch[1], loose[1]];
+      }
     }
   }
 
@@ -226,6 +309,49 @@ function stopTranscoder(queue) {
     // no-op
   }
   queue.transcoder = null;
+}
+
+function clearIdleDisconnectTimer(queue) {
+  if (!queue?.idleDisconnectTimer) return;
+  clearTimeout(queue.idleDisconnectTimer);
+  queue.idleDisconnectTimer = null;
+  queue.idleDisconnectAt = 0;
+}
+
+function scheduleIdleDisconnect(guildId, queue) {
+  if (!queue) return;
+  clearIdleDisconnectTimer(queue);
+  if (!queue.connection) return;
+
+  if (QUEUE_IDLE_DISCONNECT_MS <= 0) {
+    queue.connection?.destroy();
+    queue.connection = null;
+    queue.voiceChannel = null;
+    return;
+  }
+
+  queue.idleDisconnectAt = Date.now() + QUEUE_IDLE_DISCONNECT_MS;
+  const minutes = Math.ceil(QUEUE_IDLE_DISCONNECT_MS / 60_000);
+  queue.textChannel?.send(
+    `Cola terminada. Me quedo **${minutes} minuto(s)** en el canal por si agregan mas musica.`
+  ).catch(() => {});
+
+  queue.idleDisconnectTimer = setTimeout(() => {
+    queue.idleDisconnectTimer = null;
+    queue.idleDisconnectAt = 0;
+    const current = queues.get(guildId);
+    if (!current || current !== queue) return;
+    if (!queue.connection) return;
+    if (queue.playing || queue.nowPlaying || queue.tracks.length > 0) return;
+    queue.connection.destroy();
+    queue.connection = null;
+    queue.voiceChannel = null;
+    queue.textChannel?.send('Sali del canal por inactividad de cola.').catch(() => {});
+  }, QUEUE_IDLE_DISCONNECT_MS);
+
+  if (typeof queue.idleDisconnectTimer?.unref === 'function') {
+    queue.idleDisconnectTimer.unref();
+  }
 }
 
 function createTranscoder(inputUrl, startOffsetSec = 0) {
@@ -384,6 +510,12 @@ async function getSpotifyAccessToken(options = {}) {
 
   if (!response.ok) {
     const text = await response.text();
+    if (useUserToken) {
+      spotifyCache.user.accessToken = null;
+      spotifyCache.user.expiresAt = 0;
+      // If refresh token fails, fallback transparently to app token flow.
+      return await getSpotifyAccessToken({ forceClientCredentials: true });
+    }
     const error = new Error(`Spotify auth ${response.status}: ${text.slice(0, 300)}`);
     error.status = response.status;
     throw error;
@@ -420,6 +552,13 @@ async function spotifyApiGet(path, options = {}) {
     return await spotifyApiGet(path, { retry: false, forceClientCredentials });
   }
 
+  if (response.status === 429 && retry) {
+    const retryAfterHeader = response.headers.get('retry-after');
+    const waitMs = Math.max(1000, Math.min(10_000, Number(retryAfterHeader || 1) * 1000));
+    await sleep(waitMs);
+    return await spotifyApiGet(path, { retry: false, forceClientCredentials });
+  }
+
   if (!response.ok) {
     const text = await response.text();
     if (
@@ -428,6 +567,14 @@ async function spotifyApiGet(path, options = {}) {
       /user may not be registered/i.test(text)
     ) {
       return await spotifyApiGet(path, { retry, forceClientCredentials: true });
+    }
+    if (response.status === 403 && /user may not be registered/i.test(text)) {
+      const error = new Error(
+        'Spotify rechazo el acceso de esta app (usuario no registrado en dashboard). ' +
+        'Agrega tu cuenta en User Management de Spotify Developer o habilita acceso Web API para la app.'
+      );
+      error.status = response.status;
+      throw error;
     }
     const error = new Error(`Spotify API ${response.status}: ${text.slice(0, 300)}`);
     error.status = response.status;
@@ -450,8 +597,11 @@ async function getSpotifyTrackById(trackId) {
 
 async function getSpotifyPlaylistTracks(playlistId) {
   const tracks = [];
-  let next = `/playlists/${playlistId}/tracks?market=${encodeURIComponent(SPOTIFY_MARKET)}&limit=100`;
-  let triedWithoutMarket = false;
+  const withMarket = SPOTIFY_MARKET
+    ? `/playlists/${playlistId}/tracks?limit=100&market=${encodeURIComponent(SPOTIFY_MARKET)}`
+    : null;
+  let next = `/playlists/${playlistId}/tracks?limit=100`;
+  let triedWithMarket = false;
 
   while (tracks.length < SPOTIFY_MAX_TRACKS) {
     if (!next) break;
@@ -460,9 +610,9 @@ async function getSpotifyPlaylistTracks(playlistId) {
     try {
       data = await spotifyApiGet(next);
     } catch (error) {
-      if (error.status === 404 && !triedWithoutMarket) {
-        triedWithoutMarket = true;
-        next = `/playlists/${playlistId}/tracks?limit=100`;
+      if ((error.status === 400 || error.status === 404) && withMarket && !triedWithMarket) {
+        triedWithMarket = true;
+        next = withMarket;
         continue;
       }
       throw error;
@@ -482,7 +632,12 @@ async function getSpotifyPlaylistTracks(playlistId) {
 }
 
 async function getSpotifyPlaylistTracksFromHtml(playlistId) {
-  const response = await fetch(`https://open.spotify.com/playlist/${playlistId}`);
+  const response = await fetch(`https://open.spotify.com/playlist/${playlistId}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; DiscordBot/1.0)',
+      Accept: 'text/html,application/xhtml+xml',
+    },
+  });
   if (!response.ok) {
     throw new Error(`Spotify web ${response.status}: no pude leer la playlist`);
   }
@@ -490,14 +645,22 @@ async function getSpotifyPlaylistTracksFromHtml(playlistId) {
   const html = await response.text();
   const ids = [];
   const seen = new Set();
-  const matcher = /spotify:track:([A-Za-z0-9]{22})/g;
-  let match;
+  const patterns = [
+    /spotify:track:([A-Za-z0-9]{22})/g,
+    /"uri":"spotify:track:([A-Za-z0-9]{22})"/g,
+    /"trackUri":"spotify:track:([A-Za-z0-9]{22})"/g,
+    /"id":"([A-Za-z0-9]{22})","type":"track"/g,
+  ];
 
-  while ((match = matcher.exec(html)) !== null) {
-    const id = match[1];
-    if (!seen.has(id)) {
-      seen.add(id);
-      ids.push(id);
+  for (const matcher of patterns) {
+    let match;
+    while ((match = matcher.exec(html)) !== null) {
+      const id = match[1];
+      if (!seen.has(id)) {
+        seen.add(id);
+        ids.push(id);
+      }
+      if (ids.length >= SPOTIFY_MAX_TRACKS) break;
     }
     if (ids.length >= SPOTIFY_MAX_TRACKS) break;
   }
@@ -520,10 +683,10 @@ async function getSpotifyPlaylistTracksFromHtml(playlistId) {
 async function getSpotifyAlbumTracks(albumId) {
   let album;
   try {
-    album = await spotifyApiGet(`/albums/${albumId}?market=${encodeURIComponent(SPOTIFY_MARKET)}`);
+    album = await spotifyApiGet(`/albums/${albumId}`);
   } catch (error) {
-    if (error.status === 404) {
-      album = await spotifyApiGet(`/albums/${albumId}`);
+    if ((error.status === 400 || error.status === 404) && SPOTIFY_MARKET) {
+      album = await spotifyApiGet(`/albums/${albumId}?market=${encodeURIComponent(SPOTIFY_MARKET)}`);
     } else {
       throw error;
     }
@@ -593,6 +756,8 @@ function getQueue(guildId) {
       currentTrackStartedAt: 0,
       currentTrackPausedAt: 0,
       currentTrackPausedMs: 0,
+      idleDisconnectTimer: null,
+      idleDisconnectAt: 0,
     };
 
     player.on(AudioPlayerStatus.Idle, () => {
@@ -652,6 +817,7 @@ async function resolveSpotifyTracks(spotifyInput, requestedBy) {
   if (!normalized?.kind || !normalized?.id) return [];
 
   let spotifyTracks = [];
+  let lastError = null;
   if (normalized.kind === 'sp_track') {
     const track = await getSpotifyTrackById(normalized.id);
     if (track && track.type === 'track' && !track.is_local) {
@@ -663,20 +829,74 @@ async function resolveSpotifyTracks(spotifyInput, requestedBy) {
     try {
       spotifyTracks = await getSpotifyPlaylistTracks(normalized.id);
     } catch (error) {
-      if (error.status === 404) {
-        spotifyTracks = await getSpotifyPlaylistTracksFromHtml(normalized.id);
+      lastError = error;
+      if (
+        error.status === 400 ||
+        error.status === 401 ||
+        error.status === 403 ||
+        error.status === 404 ||
+        error.status === 429
+      ) {
+        try {
+          spotifyTracks = await getSpotifyPlaylistTracksFromHtml(normalized.id);
+        } catch (htmlError) {
+          lastError = htmlError;
+        }
       } else {
         throw error;
       }
     }
+
+    if (!spotifyTracks.length && lastError) {
+      console.warn('[Spotify] Playlist import failed:', lastError.message);
+    }
+  }
+
+  if (normalized.kind === 'sp_track' && !spotifyTracks.length) {
+    throw new Error('No pude leer ese track de Spotify. Revisa que el enlace sea valido.');
+  }
+  if (normalized.kind === 'sp_album' && !spotifyTracks.length) {
+    throw new Error('No pude leer ese album de Spotify o no tiene tracks accesibles.');
+  }
+  if (normalized.kind === 'sp_playlist' && !spotifyTracks.length) {
+    if (lastError?.message && /usuario no registrado|user may not be registered/i.test(lastError.message)) {
+      throw new Error(
+        'Spotify bloqueo la lectura de playlists para esta app. Ve a Spotify Developer Dashboard y agrega tu cuenta en User Management. No hace falta refresh token para playlists publicas.'
+      );
+    }
+    throw new Error(
+      'No pude leer esa playlist de Spotify. Verifica que sea publica y que SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET sean validos.'
+    );
   }
 
   const resolved = [];
   for (const item of spotifyTracks) {
-    const query = spotifyTrackToSearchText(item);
-    if (!query) continue;
-    const track = await resolveYoutubeTrack(query, requestedBy);
-    if (track) resolved.push({ ...track, source: 'spotify' });
+    const baseQuery = spotifyTrackToSearchText(item);
+    const fallbackQuery = `${item?.name || ''} official audio`.trim();
+    const queryCandidates = [baseQuery, fallbackQuery].filter(Boolean);
+    let added = false;
+
+    for (const query of queryCandidates) {
+      try {
+        const track = await resolveYoutubeTrack(query, requestedBy);
+        if (!track || !isValidUrl(track.url)) continue;
+        resolved.push({ ...track, source: 'spotify' });
+        added = true;
+        break;
+      } catch {
+        // Try next query candidate.
+      }
+    }
+
+    if (!added) {
+      // Keep order of successful tracks; unresolvable tracks are skipped.
+    }
+  }
+
+  if (!resolved.length && spotifyTracks.length) {
+    throw new Error(
+      'Leí la playlist/album en Spotify pero no pude encontrar versiones reproducibles en YouTube para esas canciones.'
+    );
   }
 
   return resolved;
@@ -707,19 +927,68 @@ async function resolveYouTubeTracks(url, requestedBy) {
   }
 
   if (validate === 'yt_playlist') {
-    const playlist = await playdl.playlist_info(url, { incomplete: true });
-    const videos = await playlist.all_videos();
-    return videos.map((video) => ({
-      title: video.title,
-      url: video.url || (video.id ? `https://www.youtube.com/watch?v=${video.id}` : null),
-      requestedBy,
-      source: 'youtube',
-      isLive: Boolean(video.live),
-      durationSec: parseDurationSeconds(video.durationInSec || video.durationRaw || video.duration_raw),
-    })).filter((t) => isValidUrl(t.url));
+    try {
+      const playlist = await playdl.playlist_info(url, { incomplete: true });
+      const videos = await playlist.all_videos();
+      const tracks = videos.map((video) => ({
+        title: video.title,
+        url: video.url || (video.id ? `https://www.youtube.com/watch?v=${video.id}` : null),
+        requestedBy,
+        source: 'youtube',
+        isLive: Boolean(video.live),
+        durationSec: parseDurationSeconds(video.durationInSec || video.durationRaw || video.duration_raw),
+      })).filter((t) => isValidUrl(t.url));
+      if (tracks.length) return tracks;
+    } catch {
+      // Fallback below.
+    }
+
+    return await resolveYouTubePlaylistTracksViaYtDlp(url, requestedBy);
   }
 
   return [];
+}
+
+async function resolveYouTubePlaylistTracksViaYtDlp(url, requestedBy) {
+  if (!isYouTubePlaylistLikeUrl(url)) return [];
+
+  try {
+    const output = await ytDlp(url, {
+      dumpSingleJson: true,
+      flatPlaylist: true,
+      skipDownload: true,
+      noWarnings: true,
+    });
+    const info = typeof output === 'string' ? JSON.parse(output) : output;
+    const entries = Array.isArray(info?.entries) ? info.entries : [];
+    if (!entries.length) return [];
+
+    return entries
+      .map((entry) => {
+        const webpageUrl = typeof entry?.webpage_url === 'string' ? entry.webpage_url : null;
+        const entryUrl = typeof entry?.url === 'string' ? entry.url : null;
+        const id = typeof entry?.id === 'string' ? entry.id : null;
+        const resolvedUrl = isValidUrl(webpageUrl)
+          ? webpageUrl
+          : isValidUrl(entryUrl)
+            ? entryUrl
+            : id
+              ? `https://www.youtube.com/watch?v=${id}`
+              : null;
+
+        return {
+          title: entry?.title || resolvedUrl || 'Video de YouTube',
+          url: resolvedUrl,
+          requestedBy,
+          source: 'youtube',
+          isLive: String(entry?.live_status || '').toLowerCase() === 'is_live' || Boolean(entry?.is_live),
+          durationSec: parseDurationSeconds(entry?.duration || entry?.duration_string),
+        };
+      })
+      .filter((track) => isValidUrl(track.url));
+  } catch {
+    return [];
+  }
 }
 
 async function resolveDirectMediaTrack(url, requestedBy) {
@@ -765,7 +1034,12 @@ async function resolveDirectMediaTrack(url, requestedBy) {
 }
 
 async function getTracksFromQuery(query, requestedBy) {
-  const spotifyInput = normalizeSpotifyInput(query);
+  const rawQuery = sanitizeQueryInput(query);
+  const normalizedQuery = isSpotifyShortUrl(rawQuery)
+    ? await resolveSpotifyRedirect(rawQuery)
+    : rawQuery;
+
+  const spotifyInput = normalizeSpotifyInput(normalizedQuery);
   if (spotifyInput.isSpotify) {
     if (
       spotifyInput.kind === 'sp_track' ||
@@ -777,21 +1051,30 @@ async function getTracksFromQuery(query, requestedBy) {
     return [];
   }
 
-  const validate = playdl.validate(query);
+  const youtubePlaylistLike = isYouTubePlaylistLikeUrl(normalizedQuery);
+  if (youtubePlaylistLike) {
+    const playlistTracks = await resolveYouTubePlaylistTracksViaYtDlp(normalizedQuery, requestedBy);
+    if (playlistTracks.length) return playlistTracks;
+  }
+
+  const validate = playdl.validate(normalizedQuery);
 
   if (validate === 'sp_track' || validate === 'sp_album' || validate === 'sp_playlist') {
-    return await resolveSpotifyTracks(query, requestedBy);
+    return await resolveSpotifyTracks(normalizedQuery, requestedBy);
   }
 
   if (validate === 'yt_video' || validate === 'yt_playlist') {
-    return await resolveYouTubeTracks(query, requestedBy);
+    return await resolveYouTubeTracks(normalizedQuery, requestedBy);
   }
 
-  if (isValidUrl(query)) {
-    return await resolveDirectMediaTrack(query, requestedBy);
+  if (isValidUrl(normalizedQuery)) {
+    if (youtubePlaylistLike) {
+      return [];
+    }
+    return await resolveDirectMediaTrack(normalizedQuery, requestedBy);
   }
 
-  return await resolveYoutubeTrack(query, requestedBy).then((t) => (t ? [t] : []));
+  return await resolveYoutubeTrack(normalizedQuery, requestedBy).then((t) => (t ? [t] : []));
 }
 
 async function connectToVoice(queue, voiceChannel) {
@@ -811,6 +1094,7 @@ async function connectToVoice(queue, voiceChannel) {
 
   queue.connection = connection;
   queue.voiceChannel = voiceChannel;
+  clearIdleDisconnectTimer(queue);
 
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     // If the bot is kicked/disconnected, reset state so future plays work.
@@ -821,6 +1105,7 @@ async function connectToVoice(queue, voiceChannel) {
     queue.suppressHistoryOnce = false;
     resetPlaybackTiming(queue);
     stopTranscoder(queue);
+    clearIdleDisconnectTimer(queue);
     queue.connection?.destroy();
     queue.connection = null;
     queue.voiceChannel = null;
@@ -849,22 +1134,17 @@ async function playNext(guildId) {
 
   const next = queue.tracks.shift();
   if (!next) {
-    const preserveConnection = queue.preserveConnectionOnEmpty;
     queue.preserveConnectionOnEmpty = false;
     stopTranscoder(queue);
     resetPlaybackTiming(queue);
     queue.nowPlaying = null;
     queue.playing = false;
     queue.transitionInProgress = false;
-
-    if (!preserveConnection) {
-      queue.connection?.destroy();
-      queue.connection = null;
-      queue.voiceChannel = null;
-    }
+    scheduleIdleDisconnect(guildId, queue);
     return;
   }
 
+  clearIdleDisconnectTimer(queue);
   queue.preserveConnectionOnEmpty = false;
 
   try {
@@ -942,9 +1222,18 @@ async function playNext(guildId) {
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (!message.content.startsWith(PREFIX)) return;
+  if (!message.guild) return;
 
-  const [command, ...rest] = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const [rawCommand, ...rest] = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const command = String(rawCommand || '').toLowerCase();
   const args = rest.join(' ').trim();
+
+  const pokemonHandled = await pokemonGame.handleMessageCommand({
+    command,
+    args,
+    message,
+  });
+  if (pokemonHandled) return;
 
   const queue = getQueue(message.guild.id);
   queue.textChannel = message.channel;
@@ -970,7 +1259,24 @@ client.on('messageCreate', async (message) => {
     },
   });
 
-  if (handled) return;
+  if (handled) {
+    if (command === 'stop' || command === 'play' || command === 'stream' || command === 'prev') {
+      clearIdleDisconnectTimer(queue);
+    }
+    return;
+  }
+});
+
+client.on('interactionCreate', async (interaction) => {
+  try {
+    const handled = await pokemonGame.handleInteraction(interaction);
+    if (handled) return;
+  } catch (error) {
+    console.error('Pokemon interaction error:', error);
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: 'Error procesando la accion Pokemon.', ephemeral: true });
+    }
+  }
 });
 
 client.on('voiceStateUpdate', (oldState, newState) => {
@@ -988,6 +1294,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     queue.suppressHistoryOnce = false;
     resetPlaybackTiming(queue);
     stopTranscoder(queue);
+    clearIdleDisconnectTimer(queue);
     queue.connection?.destroy();
     queue.connection = null;
     queue.voiceChannel = null;

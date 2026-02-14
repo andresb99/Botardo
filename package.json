@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "dev": "nodemon index.js",
     "start": "node index.js",
     "test": "node --test"
   },
@@ -14,13 +15,18 @@
   "dependencies": {
     "@discordjs/voice": "^0.19.0",
     "@distube/ytdl-core": "^4.16.12",
+    "@smogon/calc": "^0.10.0",
     "@snazzah/davey": "^0.1.9",
     "discord.js": "^14.25.1",
     "dotenv": "^17.2.3",
     "ffmpeg-static": "^5.3.0",
+    "firebase-admin": "^13.1.0",
     "opusscript": "^0.0.8",
     "play-dl": "^1.9.7",
     "yt-dlp-exec": "^1.0.2",
     "ytdl-core": "^4.11.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
   }
 }

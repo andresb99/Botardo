@@ -139,6 +139,26 @@ function createDeps(overrides = {}) {
   return { deps, calls };
 }
 
+test('help command: returns command list', async () => {
+  const { message, replies } = createMessage();
+  const { queue } = createQueue();
+  const { deps } = createDeps();
+
+  const handled = await handleCommand({
+    command: 'help',
+    args: '',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.match(replies[0], /Comandos disponibles:/);
+  assert.match(replies[0], /`!play <url\|busqueda>`/);
+  assert.match(replies[0], /`!playnext <posicion>`/);
+  assert.match(replies[0], /`!pokehelp`/);
+});
+
 test('play command: adds tracks and starts playback when idle', async () => {
   const { message, replies } = createMessage();
   const { queue } = createQueue();
@@ -235,6 +255,218 @@ test('skip command: keeps connection and stops current track', async () => {
   assert.equal(calls.stopTranscoder, 1);
   assert.equal(counters.stopCalls, 1);
   assert.equal(replies[0], 'Saltando pista...');
+});
+
+test('skipto command: jumps to target position while preserving pending order after target', async () => {
+  const { message, replies } = createMessage();
+  const { queue, counters } = createQueue({
+    nowPlaying: { title: 'Song A' },
+    tracks: [{ title: 'Song B' }, { title: 'Song C' }, { title: 'Song D' }],
+  });
+  const { deps, calls } = createDeps();
+
+  const handled = await handleCommand({
+    command: 'skipto',
+    args: '4',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.equal(calls.stopTranscoder, 1);
+  assert.equal(counters.stopCalls, 1);
+  assert.equal(queue.preserveConnectionOnEmpty, true);
+  assert.equal(queue.ignoreAbortErrors, true);
+  assert.deepEqual(queue.tracks.map((track) => track.title), ['Song D']);
+  assert.match(replies[0], /Saltando a la posicion 4: \*\*Song D\*\*/);
+});
+
+test('skipto command: drops earlier pending tracks when nothing is playing', async () => {
+  const { message, replies } = createMessage();
+  const { queue } = createQueue({
+    nowPlaying: null,
+    playing: false,
+    tracks: [{ title: 'Song A' }, { title: 'Song B' }, { title: 'Song C' }],
+  });
+  const { deps, calls } = createDeps();
+
+  const handled = await handleCommand({
+    command: 'skipto',
+    args: '2',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.equal(calls.playNext, 1);
+  assert.deepEqual(queue.tracks.map((track) => track.title), ['Song B', 'Song C']);
+  assert.match(replies[0], /Cola adelantada a la posicion 2: \*\*Song B\*\*/);
+});
+
+test('move command: reorders pending queue positions while a song is playing', async () => {
+  const { message, replies } = createMessage();
+  const { queue } = createQueue({
+    nowPlaying: { title: 'Song A' },
+    tracks: [{ title: 'Song B' }, { title: 'Song C' }, { title: 'Song D' }],
+  });
+  const { deps } = createDeps();
+
+  const handled = await handleCommand({
+    command: 'move',
+    args: '4 2',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.deepEqual(queue.tracks.map((track) => track.title), ['Song D', 'Song B', 'Song C']);
+  assert.equal(replies[0], 'Movi **Song D** de la posicion 4 a la 2.');
+});
+
+test('move command: blocks attempts to move current song (position 1)', async () => {
+  const { message, replies } = createMessage();
+  const { queue } = createQueue({
+    nowPlaying: { title: 'Song A' },
+    tracks: [{ title: 'Song B' }, { title: 'Song C' }],
+  });
+  const { deps } = createDeps();
+
+  const handled = await handleCommand({
+    command: 'move',
+    args: '1 2',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.equal(replies[0], 'No puedes mover la pista que ya esta sonando (posicion 1).');
+});
+
+test('remove command: removes pending track by queue position while playing', async () => {
+  const { message, replies } = createMessage();
+  const { queue } = createQueue({
+    nowPlaying: { title: 'Song A' },
+    tracks: [{ title: 'Song B' }, { title: 'Song C' }, { title: 'Song D' }],
+  });
+  const { deps } = createDeps();
+
+  const handled = await handleCommand({
+    command: 'remove',
+    args: '3',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.deepEqual(queue.tracks.map((track) => track.title), ['Song B', 'Song D']);
+  assert.equal(replies[0], 'Removida de la cola (posicion 3): **Song C**.');
+});
+
+test('remove command: blocks removing currently playing position', async () => {
+  const { message, replies } = createMessage();
+  const { queue } = createQueue({
+    nowPlaying: { title: 'Song A' },
+    tracks: [{ title: 'Song B' }],
+  });
+  const { deps } = createDeps();
+
+  const handled = await handleCommand({
+    command: 'remove',
+    args: '1',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.deepEqual(queue.tracks.map((track) => track.title), ['Song B']);
+  assert.equal(replies[0], 'No puedes remover la pista actual con `!remove`. Usa `!skip`.');
+});
+
+test('remove command: removes first pending track when idle', async () => {
+  const { message, replies } = createMessage();
+  const { queue } = createQueue({
+    nowPlaying: null,
+    tracks: [{ title: 'Song A' }, { title: 'Song B' }],
+  });
+  const { deps } = createDeps();
+
+  const handled = await handleCommand({
+    command: 'remove',
+    args: '1',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.deepEqual(queue.tracks.map((track) => track.title), ['Song B']);
+  assert.equal(replies[0], 'Removida de la cola (posicion 1): **Song A**.');
+});
+
+test('playnext command: promotes a later queue position to play immediately after current', async () => {
+  const { message, replies } = createMessage();
+  const { queue } = createQueue({
+    nowPlaying: { title: 'Song 12' },
+    tracks: [
+      { title: 'Song 13' },
+      { title: 'Song 14' },
+      { title: 'Song 15' },
+      { title: 'Song 20' },
+    ],
+  });
+  const { deps } = createDeps();
+
+  const handled = await handleCommand({
+    command: 'playnext',
+    args: '5',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.deepEqual(queue.tracks.map((track) => track.title), [
+    'Song 20',
+    'Song 13',
+    'Song 14',
+    'Song 15',
+  ]);
+  assert.equal(
+    replies[0],
+    'Listo: **Song 20** sonara justo despues de la actual (movida de 5 a 2).'
+  );
+});
+
+test('playnext command: moves selected track to front when idle', async () => {
+  const { message, replies } = createMessage();
+  const { queue } = createQueue({
+    nowPlaying: null,
+    playing: false,
+    tracks: [{ title: 'Song A' }, { title: 'Song B' }, { title: 'Song C' }],
+  });
+  const { deps, calls } = createDeps();
+
+  const handled = await handleCommand({
+    command: 'playnext',
+    args: '3',
+    message,
+    queue,
+    deps,
+  });
+
+  assert.equal(handled, true);
+  assert.equal(calls.playNext, 1);
+  assert.deepEqual(queue.tracks.map((track) => track.title), ['Song C', 'Song A', 'Song B']);
+  assert.equal(
+    replies[0],
+    'Listo: **Song C** paso al frente de la cola (movida de 3 a 1).'
+  );
 });
 
 test('timeskip command: seeks inside current track when target is within duration', async () => {

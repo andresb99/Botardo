@@ -59,6 +59,36 @@ function formatSeconds(value) {
   return `${minutes}:${String(secs).padStart(2, '0')}`;
 }
 
+function parsePositiveInt(value) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function buildHelpText() {
+  return [
+    'Comandos disponibles:',
+    '`!help` - mostrar esta ayuda',
+    '`!play <url|busqueda>` / `!stream <url|busqueda>` - agregar pista(s)',
+    '`!skip` - saltar pista actual',
+    '`!skipto <posicion>` (`!jump`) - saltar a una posicion de cola',
+    '`!playnext <posicion>` (`!upnext`) - poner una pista como siguiente',
+    '`!move <desde> <hacia>` - reordenar cola',
+    '`!remove <posicion>` (`!rm`, `!del`) - quitar una pista de la cola',
+    '`!timeskip <segundos>` (`!seek`, `!ts`) - adelantar dentro de la pista',
+    '`!prev` - volver a la pista anterior',
+    '`!pause` / `!resume` - pausar o reanudar',
+    '`!queue` - ver cola resumida',
+    '`!allqueue` (`!all queue`) - ver historial + cola completa',
+    '`!clear` - limpiar pendientes',
+    '`!stop` - detener y desconectar',
+    '`!ask <pregunta>` - consultar Gemini',
+    '`!pokehelp` - comandos del mini-juego Pokemon',
+    '`!evolve <slot|PKxxxx|indice>` - evolucionar Pokemon (ver requisitos en pokehelp)',
+    'Nota de posiciones: si hay cancion sonando, la posicion 1 es la actual.',
+  ].join('\n');
+}
+
 async function handleCommand({ command, args, message, queue, deps }) {
   const {
     connectToVoice,
@@ -74,6 +104,11 @@ async function handleCommand({ command, args, message, queue, deps }) {
     markPlaybackResumed = () => {},
     maxAskChunks = 4,
   } = deps;
+
+  if (command === 'help' || command === 'commands' || command === 'ayuda') {
+    await message.reply(buildHelpText());
+    return true;
+  }
 
   if (command === 'play' || command === 'stream') {
     if (!args) {
@@ -152,6 +187,242 @@ async function handleCommand({ command, args, message, queue, deps }) {
     stopTranscoder(queue);
     queue.player.stop(true);
     await message.reply('Saltando pista...');
+    return true;
+  }
+
+  if (command === 'skipto' || command === 'jump' || command === 'jumpto') {
+    const targetPosition = parsePositiveInt(args?.trim());
+    if (!targetPosition) {
+      await message.reply('Uso: `!skipto <posicion>`');
+      return true;
+    }
+
+    if (!queue.nowPlaying && !queue.tracks.length) {
+      await message.reply('La cola esta vacia.');
+      return true;
+    }
+
+    if (queue.nowPlaying) {
+      const maxPosition = queue.tracks.length + 1;
+      if (targetPosition < 1 || targetPosition > maxPosition) {
+        await message.reply(`Posicion invalida. Debe estar entre 1 y ${maxPosition}.`);
+        return true;
+      }
+
+      if (targetPosition === 1) {
+        await message.reply('Esa pista ya esta sonando.');
+        return true;
+      }
+
+      const beforeTarget = targetPosition - 2;
+      const skippedPending = queue.tracks.splice(0, beforeTarget);
+      const targetTrack = queue.tracks[0];
+      if (!targetTrack) {
+        await message.reply('No pude encontrar esa pista en la cola.');
+        return true;
+      }
+
+      queue.preserveConnectionOnEmpty = true;
+      queue.ignoreAbortErrors = true;
+      stopTranscoder(queue);
+      queue.player.stop(true);
+      await message.reply(
+        `Saltando a la posicion ${targetPosition}: **${targetTrack.title}**. ` +
+        `Se omitieron ${skippedPending.length + 1} pista(s).`
+      );
+      return true;
+    }
+
+    const maxPosition = queue.tracks.length;
+    if (targetPosition < 1 || targetPosition > maxPosition) {
+      await message.reply(`Posicion invalida. Debe estar entre 1 y ${maxPosition}.`);
+      return true;
+    }
+
+    if (targetPosition === 1) {
+      await message.reply('Esa pista ya es la siguiente en la cola.');
+      return true;
+    }
+
+    const skipped = queue.tracks.splice(0, targetPosition - 1);
+    const targetTrack = queue.tracks[0];
+    if (queue.connection && !queue.playing && !queue.nowPlaying && queue.tracks.length) {
+      await playNext(message.guild.id);
+    }
+    await message.reply(
+      `Cola adelantada a la posicion ${targetPosition}: **${targetTrack?.title || 'Sin titulo'}**. ` +
+      `Se omitieron ${skipped.length} pista(s).`
+    );
+    return true;
+  }
+
+  if (command === 'playnext' || command === 'upnext' || command === 'nextup') {
+    const targetPosition = parsePositiveInt(args?.trim());
+    if (!targetPosition) {
+      await message.reply('Uso: `!playnext <posicion>`');
+      return true;
+    }
+
+    if (!queue.nowPlaying && !queue.tracks.length) {
+      await message.reply('La cola esta vacia.');
+      return true;
+    }
+
+    if (queue.nowPlaying) {
+      const maxPosition = queue.tracks.length + 1;
+      if (targetPosition < 2 || targetPosition > maxPosition) {
+        await message.reply(`Posicion invalida. Debe estar entre 2 y ${maxPosition}.`);
+        return true;
+      }
+      if (targetPosition === 2) {
+        await message.reply('Esa pista ya esta programada como siguiente.');
+        return true;
+      }
+
+      const fromIndex = targetPosition - 2;
+      const [track] = queue.tracks.splice(fromIndex, 1);
+      queue.tracks.unshift(track);
+      await message.reply(
+        `Listo: **${track?.title || 'Sin titulo'}** sonara justo despues de la actual ` +
+        `(movida de ${targetPosition} a 2).`
+      );
+      return true;
+    }
+
+    const maxPosition = queue.tracks.length;
+    if (targetPosition < 1 || targetPosition > maxPosition) {
+      await message.reply(`Posicion invalida. Debe estar entre 1 y ${maxPosition}.`);
+      return true;
+    }
+    if (targetPosition === 1) {
+      await message.reply('Esa pista ya esta al frente de la cola.');
+      return true;
+    }
+
+    const fromIndex = targetPosition - 1;
+    const [track] = queue.tracks.splice(fromIndex, 1);
+    queue.tracks.unshift(track);
+    if (queue.connection && !queue.playing && !queue.nowPlaying && queue.tracks.length) {
+      await playNext(message.guild.id);
+    }
+    await message.reply(
+      `Listo: **${track?.title || 'Sin titulo'}** paso al frente de la cola ` +
+      `(movida de ${targetPosition} a 1).`
+    );
+    return true;
+  }
+
+  if (command === 'move' || command === 'movetrack' || command === 'reorder') {
+    const [fromRaw, toRaw] = String(args || '').trim().split(/\s+/);
+    const fromPosition = parsePositiveInt(fromRaw);
+    const toPosition = parsePositiveInt(toRaw);
+    if (!fromPosition || !toPosition) {
+      await message.reply('Uso: `!move <desde> <hacia>`');
+      return true;
+    }
+
+    if (!queue.nowPlaying && queue.tracks.length < 2) {
+      await message.reply('No hay suficientes pistas para reordenar.');
+      return true;
+    }
+
+    if (queue.nowPlaying) {
+      const maxPosition = queue.tracks.length + 1;
+      if (fromPosition === 1 || toPosition === 1) {
+        await message.reply('No puedes mover la pista que ya esta sonando (posicion 1).');
+        return true;
+      }
+      if (
+        fromPosition < 2 ||
+        fromPosition > maxPosition ||
+        toPosition < 2 ||
+        toPosition > maxPosition
+      ) {
+        await message.reply(`Posiciones invalidas. Deben estar entre 2 y ${maxPosition}.`);
+        return true;
+      }
+      if (fromPosition === toPosition) {
+        await message.reply('La pista ya esta en esa posicion.');
+        return true;
+      }
+
+      const fromIndex = fromPosition - 2;
+      const toIndex = toPosition - 2;
+      const [track] = queue.tracks.splice(fromIndex, 1);
+      queue.tracks.splice(toIndex, 0, track);
+      await message.reply(
+        `Movi **${track?.title || 'Sin titulo'}** de la posicion ${fromPosition} a la ${toPosition}.`
+      );
+      return true;
+    }
+
+    const maxPosition = queue.tracks.length;
+    if (
+      fromPosition < 1 ||
+      fromPosition > maxPosition ||
+      toPosition < 1 ||
+      toPosition > maxPosition
+    ) {
+      await message.reply(`Posiciones invalidas. Deben estar entre 1 y ${maxPosition}.`);
+      return true;
+    }
+    if (fromPosition === toPosition) {
+      await message.reply('La pista ya esta en esa posicion.');
+      return true;
+    }
+
+    const fromIndex = fromPosition - 1;
+    const toIndex = toPosition - 1;
+    const [track] = queue.tracks.splice(fromIndex, 1);
+    queue.tracks.splice(toIndex, 0, track);
+    await message.reply(
+      `Movi **${track?.title || 'Sin titulo'}** de la posicion ${fromPosition} a la ${toPosition}.`
+    );
+    return true;
+  }
+
+  if (command === 'remove' || command === 'rm' || command === 'del') {
+    const targetPosition = parsePositiveInt(args?.trim());
+    if (!targetPosition) {
+      await message.reply('Uso: `!remove <posicion>`');
+      return true;
+    }
+
+    if (!queue.nowPlaying && !queue.tracks.length) {
+      await message.reply('La cola esta vacia.');
+      return true;
+    }
+
+    if (queue.nowPlaying) {
+      const maxPosition = queue.tracks.length + 1;
+      if (targetPosition < 1 || targetPosition > maxPosition) {
+        await message.reply(`Posicion invalida. Debe estar entre 1 y ${maxPosition}.`);
+        return true;
+      }
+      if (targetPosition === 1) {
+        await message.reply('No puedes remover la pista actual con `!remove`. Usa `!skip`.');
+        return true;
+      }
+
+      const removeIndex = targetPosition - 2;
+      const [removed] = queue.tracks.splice(removeIndex, 1);
+      await message.reply(
+        `Removida de la cola (posicion ${targetPosition}): **${removed?.title || 'Sin titulo'}**.`
+      );
+      return true;
+    }
+
+    const maxPosition = queue.tracks.length;
+    if (targetPosition < 1 || targetPosition > maxPosition) {
+      await message.reply(`Posicion invalida. Debe estar entre 1 y ${maxPosition}.`);
+      return true;
+    }
+
+    const removeIndex = targetPosition - 1;
+    const [removed] = queue.tracks.splice(removeIndex, 1);
+    await message.reply(
+      `Removida de la cola (posicion ${targetPosition}): **${removed?.title || 'Sin titulo'}**.`
+    );
     return true;
   }
 
