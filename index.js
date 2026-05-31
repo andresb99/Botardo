@@ -19,7 +19,6 @@ const {
   entersState,
   VoiceConnectionStatus,
 } = require('@discordjs/voice');
-const playdl = require('play-dl');
 const ytDlp = require('yt-dlp-exec');
 const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
@@ -389,19 +388,39 @@ function createTranscoder(inputUrl, startOffsetSec = 0) {
   );
 }
 
+function isRateLimitError(error) {
+  return /rate-limit|try again later|429|too many requests/i.test(String(error?.message || ''));
+}
+
 async function getDirectAudioUrl(videoUrl) {
-  const output = await ytDlp(videoUrl, {
-    g: true,
-    f: 'bestaudio/best',
-    noPlaylist: true,
-    noWarnings: true,
-  });
-  const directUrl = String(output).split(/\r?\n/).find((line) => line.trim());
-  if (isValidUrl(directUrl)) {
-    return directUrl.trim();
+  const maxAttempts = 3;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const output = await ytDlp(videoUrl, {
+        g: true,
+        f: 'bestaudio/best',
+        noPlaylist: true,
+        noWarnings: true,
+      });
+      const directUrl = String(output).split(/\r?\n/).find((line) => line.trim());
+      if (isValidUrl(directUrl)) {
+        return directUrl.trim();
+      }
+      throw new Error('No se pudo obtener una URL directa valida.');
+    } catch (error) {
+      lastError = error;
+      // YouTube rate-limita por rafagas; un backoff corto suele destrabarlo.
+      if (isRateLimitError(error) && attempt < maxAttempts) {
+        await sleep(attempt * 2000);
+        continue;
+      }
+      throw error;
+    }
   }
 
-  throw new Error('No se pudo obtener una URL directa valida.');
+  throw lastError || new Error('No se pudo obtener una URL directa valida.');
 }
 
 function buildPlaybackErrorHint(error) {
@@ -732,16 +751,69 @@ function spotifyTrackToSearchText(track) {
   return `${name} ${artists}`.trim();
 }
 
+// --- Camino publico sin API ni Premium ---
+// Spotify bloquea su Web API detras de "premium required" para algunas apps, pero la
+// pagina /embed expone metadata (titulo + artistas + lista de tracks) sin autenticacion.
+async function fetchSpotifyEmbedEntity(kind, id) {
+  const slug = kind === 'sp_album' ? 'album' : kind === 'sp_playlist' ? 'playlist' : 'track';
+  const response = await fetch(`https://open.spotify.com/embed/${slug}/${id}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; DiscordBot/1.0)',
+      Accept: 'text/html,application/xhtml+xml',
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`Spotify embed ${response.status}: no pude leer ${slug}`);
+  }
+  const html = await response.text();
+  const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+  if (!match) return null;
+  try {
+    const json = JSON.parse(match[1]);
+    return json?.props?.pageProps?.state?.data?.entity || null;
+  } catch {
+    return null;
+  }
+}
+
+// Devuelve objetos compatibles con spotifyTrackToSearchText: { name, artists: [{ name }] }.
+async function getSpotifyTracksFromEmbed(kind, id) {
+  const entity = await fetchSpotifyEmbedEntity(kind, id);
+  if (!entity) return [];
+
+  const toTrack = (name, artistText) => ({
+    name: name || '',
+    artists: artistText ? [{ name: artistText }] : [],
+    type: 'track',
+    is_local: false,
+  });
+
+  if (kind === 'sp_track') {
+    const name = entity.title || entity.name;
+    if (!name) return [];
+    const artistText = (entity.artists || []).map((a) => a.name).filter(Boolean).join(', ');
+    return [toTrack(name, artistText)];
+  }
+
+  const list = Array.isArray(entity.trackList) ? entity.trackList : [];
+  return list
+    .filter((t) => t && t.title)
+    .slice(0, SPOTIFY_MAX_TRACKS)
+    .map((t) => toTrack(t.title, t.subtitle));
+}
+
 async function prefetchNext(guildId) {
   const queue = queues.get(guildId);
   if (!queue) return;
   const next = queue.tracks[0];
   if (!next || next.prefetching || next.prefetchedUrl) return;
-  if (next.isLive) return;
-  if (!isValidUrl(next.url)) return;
 
   next.prefetching = true;
   try {
+    if (next.pendingYoutube && !isValidUrl(next.url)) {
+      await ensureTrackResolved(next);
+    }
+    if (next.isLive || !isValidUrl(next.url)) return;
     next.prefetchedUrl = await getDirectAudioUrl(next.url);
   } catch {
     // Ignore prefetch errors; we'll try again on actual play.
@@ -814,19 +886,54 @@ function getQueue(guildId) {
 }
 
 async function resolveYoutubeTrack(query, requestedBy) {
-  const result = await playdl.search(query, { limit: 1 });
-  if (!result.length) return null;
-  const video = result[0];
-  const url = video.url || (video.id ? `https://www.youtube.com/watch?v=${video.id}` : null);
-  if (!isValidUrl(url)) return null;
-  return {
-    title: video.title ?? query,
-    url,
-    requestedBy,
-    source: 'youtube',
-    isLive: Boolean(video.live),
-    durationSec: parseDurationSeconds(video.durationInSec || video.durationRaw || video.duration_raw),
-  };
+  // Buscamos con yt-dlp (estable y mismo motor que la reproduccion).
+  try {
+    // Usamos flatPlaylist (rapido y evita el rate-limit de YouTube). Una busqueda por
+    // nombre de artista suele devolver primero el CANAL (ie_key "YoutubeTab"), asi que
+    // pedimos varios resultados y elegimos el primer VIDEO real.
+    const output = await ytDlp(`ytsearch5:${query}`, {
+      dumpSingleJson: true,
+      flatPlaylist: true,
+      skipDownload: true,
+      noWarnings: true,
+    });
+    const info = typeof output === 'string' ? JSON.parse(output) : output;
+    const entries = Array.isArray(info?.entries) ? info.entries : (info ? [info] : []);
+
+    const isVideoEntry = (e) => {
+      if (!e) return false;
+      if (e.ie_key && e.ie_key !== 'Youtube') return false; // YoutubeTab = canal/playlist
+      const id = typeof e.id === 'string' ? e.id : '';
+      const u = e.webpage_url || e.url || '';
+      return /[?&]v=|youtu\.be\//.test(u) || id.length === 11;
+    };
+
+    const entry = entries.find(isVideoEntry);
+    if (entry) {
+      const id = typeof entry.id === 'string' ? entry.id : null;
+      const url = isValidUrl(entry.webpage_url) && /[?&]v=|youtu\.be\//.test(entry.webpage_url)
+        ? entry.webpage_url
+        : isValidUrl(entry.url) && /[?&]v=|youtu\.be\//.test(entry.url)
+          ? entry.url
+          : id
+            ? `https://www.youtube.com/watch?v=${id}`
+            : null;
+      if (isValidUrl(url)) {
+        return {
+          title: entry.title ?? query,
+          url,
+          requestedBy,
+          source: 'youtube',
+          isLive: String(entry.live_status || '').toLowerCase() === 'is_live' || Boolean(entry.is_live),
+          durationSec: parseDurationSeconds(entry.duration || entry.duration_string),
+        };
+      }
+    }
+  } catch (error) {
+    console.warn('[YouTube] Busqueda con yt-dlp fallo:', error.message);
+  }
+
+  return null;
 }
 
 async function resolveSpotifyTracks(spotifyInput, requestedBy) {
@@ -837,37 +944,47 @@ async function resolveSpotifyTracks(spotifyInput, requestedBy) {
 
   let spotifyTracks = [];
   let lastError = null;
-  if (normalized.kind === 'sp_track') {
-    const track = await getSpotifyTrackById(normalized.id);
-    if (track && track.type === 'track' && !track.is_local) {
-      spotifyTracks = [track];
-    }
-  } else if (normalized.kind === 'sp_album') {
-    spotifyTracks = await getSpotifyAlbumTracks(normalized.id);
-  } else if (normalized.kind === 'sp_playlist') {
-    try {
-      spotifyTracks = await getSpotifyPlaylistTracks(normalized.id);
-    } catch (error) {
-      lastError = error;
-      if (
-        error.status === 400 ||
-        error.status === 401 ||
-        error.status === 403 ||
-        error.status === 404 ||
-        error.status === 429
-      ) {
-        try {
-          spotifyTracks = await getSpotifyPlaylistTracksFromHtml(normalized.id);
-        } catch (htmlError) {
-          lastError = htmlError;
-        }
-      } else {
-        throw error;
-      }
-    }
 
-    if (!spotifyTracks.length && lastError) {
-      console.warn('[Spotify] Playlist import failed:', lastError.message);
+  // 1) Camino publico (embed, sin API ni Premium). Es el que funciona aunque Spotify
+  //    bloquee la Web API. Si falla, caemos a la Web API oficial mas abajo.
+  try {
+    spotifyTracks = await getSpotifyTracksFromEmbed(normalized.kind, normalized.id);
+  } catch (embedError) {
+    lastError = embedError;
+    console.warn('[Spotify] Lectura via embed fallo, intentando Web API:', embedError.message);
+  }
+
+  // 2) Fallback a la Web API oficial (requiere credenciales validas / Premium).
+  if (!spotifyTracks.length) {
+    try {
+      if (normalized.kind === 'sp_track') {
+        const track = await getSpotifyTrackById(normalized.id);
+        if (track && track.type === 'track' && !track.is_local) {
+          spotifyTracks = [track];
+        }
+      } else if (normalized.kind === 'sp_album') {
+        spotifyTracks = await getSpotifyAlbumTracks(normalized.id);
+      } else if (normalized.kind === 'sp_playlist') {
+        try {
+          spotifyTracks = await getSpotifyPlaylistTracks(normalized.id);
+        } catch (error) {
+          lastError = error;
+          if (
+            error.status === 400 ||
+            error.status === 401 ||
+            error.status === 403 ||
+            error.status === 404 ||
+            error.status === 429
+          ) {
+            spotifyTracks = await getSpotifyPlaylistTracksFromHtml(normalized.id);
+          } else {
+            throw error;
+          }
+        }
+      }
+    } catch (apiError) {
+      lastError = apiError;
+      console.warn('[Spotify] Web API fallo:', apiError.message);
     }
   }
 
@@ -888,84 +1005,106 @@ async function resolveSpotifyTracks(spotifyInput, requestedBy) {
     );
   }
 
+  // Encolamos "stubs" al instante: la busqueda en YouTube de cada tema se hace de forma
+  // diferida (lazy) recien al reproducir/prefetch. Asi una playlist de 80 temas se agrega
+  // en segundos en vez de esperar ~80 busquedas secuenciales antes de sonar.
   const resolved = [];
   for (const item of spotifyTracks) {
     const baseQuery = spotifyTrackToSearchText(item);
+    if (!baseQuery) continue;
     const fallbackQuery = `${item?.name || ''} official audio`.trim();
-    const queryCandidates = [baseQuery, fallbackQuery].filter(Boolean);
-    let added = false;
-
-    for (const query of queryCandidates) {
-      try {
-        const track = await resolveYoutubeTrack(query, requestedBy);
-        if (!track || !isValidUrl(track.url)) continue;
-        resolved.push({ ...track, source: 'spotify' });
-        added = true;
-        break;
-      } catch {
-        // Try next query candidate.
-      }
-    }
-
-    if (!added) {
-      // Keep order of successful tracks; unresolvable tracks are skipped.
-    }
+    resolved.push({
+      title: baseQuery,
+      url: null,
+      searchQueries: [baseQuery, fallbackQuery].filter(Boolean),
+      requestedBy,
+      source: 'spotify',
+      isLive: false,
+      durationSec: null,
+      pendingYoutube: true,
+    });
   }
 
   if (!resolved.length && spotifyTracks.length) {
     throw new Error(
-      'Leí la playlist/album en Spotify pero no pude encontrar versiones reproducibles en YouTube para esas canciones.'
+      'Leí la playlist/album en Spotify pero no pude armar la lista de canciones para buscar en YouTube.'
     );
   }
 
   return resolved;
 }
 
-async function resolveYouTubeTracks(url, requestedBy) {
-  const validate = playdl.validate(url);
-
-  if (validate === 'yt_video') {
-    const info = await playdl.video_info(url);
-    const resolvedUrl = info.video_details.url || `https://www.youtube.com/watch?v=${info.video_details.id}`;
-    if (!isValidUrl(resolvedUrl)) return [];
-    return [
-      {
-        title: info.video_details.title,
-        url: resolvedUrl,
-        requestedBy,
-        source: 'youtube',
-        isLive: Boolean(info.video_details.live),
-        durationSec: parseDurationSeconds(
-          info.video_details.durationInSec
-            || info.video_details.durationRaw
-            || info.video_details.duration_raw
-            || info.video_details.duration
-        ),
-      },
-    ];
+// Resuelve de forma diferida la URL de YouTube de un track de Spotify (pendingYoutube).
+// Devuelve true si quedo con una URL reproducible.
+async function ensureTrackResolved(track) {
+  if (!track || !track.pendingYoutube) return true;
+  if (isValidUrl(track.url)) {
+    track.pendingYoutube = false;
+    return true;
   }
+  const queries = Array.isArray(track.searchQueries) && track.searchQueries.length
+    ? track.searchQueries
+    : (track.searchQuery ? [track.searchQuery] : []);
 
-  if (validate === 'yt_playlist') {
+  for (const query of queries) {
     try {
-      const playlist = await playdl.playlist_info(url, { incomplete: true });
-      const videos = await playlist.all_videos();
-      const tracks = videos.map((video) => ({
-        title: video.title,
-        url: video.url || (video.id ? `https://www.youtube.com/watch?v=${video.id}` : null),
-        requestedBy,
-        source: 'youtube',
-        isLive: Boolean(video.live),
-        durationSec: parseDurationSeconds(video.durationInSec || video.durationRaw || video.duration_raw),
-      })).filter((t) => isValidUrl(t.url));
-      if (tracks.length) return tracks;
+      const yt = await resolveYoutubeTrack(query, track.requestedBy);
+      if (yt && isValidUrl(yt.url)) {
+        track.url = yt.url;
+        if (yt.title) track.title = yt.title;
+        track.isLive = yt.isLive;
+        track.durationSec = yt.durationSec;
+        track.pendingYoutube = false;
+        return true;
+      }
     } catch {
-      // Fallback below.
+      // Probar siguiente query.
     }
+  }
+  return false;
+}
 
+async function resolveYouTubeVideoViaYtDlp(url, requestedBy) {
+  const output = await ytDlp(url, {
+    dumpSingleJson: true,
+    skipDownload: true,
+    noWarnings: true,
+    noPlaylist: true,
+  });
+  const info = typeof output === 'string' ? JSON.parse(output) : output;
+  if (!info?.id && !info?.webpage_url) return [];
+  const resolvedUrl = isValidUrl(info.webpage_url)
+    ? info.webpage_url
+    : info.id
+      ? `https://www.youtube.com/watch?v=${info.id}`
+      : null;
+  if (!isValidUrl(resolvedUrl)) return [];
+  return [
+    {
+      title: info.title || resolvedUrl,
+      url: resolvedUrl,
+      requestedBy,
+      source: 'youtube',
+      isLive: Boolean(info.is_live),
+      durationSec: parseDurationSeconds(info.duration || info.duration_string),
+    },
+  ];
+}
+
+async function resolveYouTubeTracks(url, requestedBy) {
+  if (!isYouTubeUrl(url)) return [];
+
+  if (isYouTubePlaylistLikeUrl(url)) {
     return await resolveYouTubePlaylistTracksViaYtDlp(url, requestedBy);
   }
 
-  return [];
+  // Video suelto: extraemos info con yt-dlp (mismo motor que la reproduccion).
+  try {
+    return await resolveYouTubeVideoViaYtDlp(url, requestedBy);
+  } catch (error) {
+    console.warn('[YouTube] No pude leer la info del video con yt-dlp:', error.message);
+    return [];
+  }
 }
 
 async function resolveYouTubePlaylistTracksViaYtDlp(url, requestedBy) {
@@ -1076,13 +1215,7 @@ async function getTracksFromQuery(query, requestedBy) {
     if (playlistTracks.length) return playlistTracks;
   }
 
-  const validate = playdl.validate(normalizedQuery);
-
-  if (validate === 'sp_track' || validate === 'sp_album' || validate === 'sp_playlist') {
-    return await resolveSpotifyTracks(normalizedQuery, requestedBy);
-  }
-
-  if (validate === 'yt_video' || validate === 'yt_playlist') {
+  if (isYouTubeUrl(normalizedQuery)) {
     return await resolveYouTubeTracks(normalizedQuery, requestedBy);
   }
 
@@ -1167,6 +1300,15 @@ async function playNext(guildId) {
   queue.preserveConnectionOnEmpty = false;
 
   try {
+    if (next.pendingYoutube && !isValidUrl(next.url)) {
+      const ok = await ensureTrackResolved(next);
+      if (!ok) {
+        queue.textChannel?.send(`No encontre version reproducible en YouTube para **${next.title}**, la salto.`);
+        queue.transitionInProgress = false;
+        await playNext(guildId);
+        return;
+      }
+    }
     if (!isValidUrl(next.url)) {
       queue.textChannel?.send('No encontre una URL valida para esa pista.');
       queue.transitionInProgress = false;
